@@ -1,22 +1,32 @@
 services:
-  blog-engine:
+  app:
     build: .
     ports:
-      - "${PORT:-3000}:3000"
-    volumes:
-      - blog_data:/data
+      - "3000:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - DB_PATH=/data/blog_automation.db
+      - DATABASE_URL=postgresql://blogengine:blogengine@db:5432/blogdb
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
+
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: blogengine
+      POSTGRES_PASSWORD: blogengine
+      POSTGRES_DB: blogdb
+    volumes:
+      - blog_pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
-      interval: 30s
+      test: ["CMD-SHELL", "pg_isready -U blogengine -d blogdb"]
+      interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 15s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
-  blog_data:
+  blog_pg_data:
     driver: local

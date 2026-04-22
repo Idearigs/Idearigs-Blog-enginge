@@ -1,100 +1,98 @@
 const express = require("express");
-const cors = require("cors");
-const path = require("path");
-const Database = require("better-sqlite3");
+const cors    = require("cors");
+const path    = require("path");
+const { Pool } = require("pg");
 
 const isProd = process.env.NODE_ENV === "production";
-const PORT = parseInt(process.env.PORT || (isProd ? "3000" : "3001"), 10);
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, isProd ? "/data/blog_automation.db" : "blog_automation.db");
+const PORT   = parseInt(process.env.PORT || (isProd ? "3000" : "3001"), 10);
 
 const app = express();
 
-// ── Init SQLite ──────────────────────────────────────────────────
-const db = new Database(DB_PATH);
+// ── PostgreSQL ───────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("localhost") ? false : { rejectUnauthorized: false },
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS articles (
-    id           TEXT PRIMARY KEY,
-    month_key    TEXT NOT NULL,
-    title        TEXT,
-    seo_title    TEXT,
-    slug         TEXT,
-    category     TEXT,
-    keywords     TEXT,
-    meta_desc    TEXT,
-    content      TEXT,
-    word_count   INTEGER DEFAULT 0,
-    status       TEXT DEFAULT 'pending',
-    scheduled_at TEXT,
-    images       TEXT,
-    error        TEXT,
-    created_at   TEXT DEFAULT (datetime('now')),
-    updated_at   TEXT DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_articles_month ON articles(month_key);
-`);
+const initDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_state (
+      key        TEXT PRIMARY KEY,
+      value      JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
 
-const getState  = db.prepare("SELECT value FROM state WHERE key = ?");
-const setState  = db.prepare(`
-  INSERT INTO state (key, value, updated_at) VALUES (?, ?, datetime('now'))
-  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-`);
-const upsertArticle = db.prepare(`
-  INSERT INTO articles
-    (id, month_key, title, seo_title, slug, category, keywords, meta_desc,
-     content, word_count, status, scheduled_at, images, error, updated_at)
-  VALUES
-    (@id, @month_key, @title, @seo_title, @slug, @category, @keywords, @meta_desc,
-     @content, @word_count, @status, @scheduled_at, @images, @error, datetime('now'))
-  ON CONFLICT(id) DO UPDATE SET
-    title=excluded.title, seo_title=excluded.seo_title, slug=excluded.slug,
-    category=excluded.category, keywords=excluded.keywords, meta_desc=excluded.meta_desc,
-    content=excluded.content, word_count=excluded.word_count, status=excluded.status,
-    scheduled_at=excluded.scheduled_at, images=excluded.images, error=excluded.error,
-    updated_at=datetime('now')
-`);
+    CREATE TABLE IF NOT EXISTS articles (
+      id           TEXT PRIMARY KEY,
+      month_key    TEXT NOT NULL,
+      title        TEXT,
+      seo_title    TEXT,
+      slug         TEXT,
+      category     TEXT,
+      keywords     TEXT,
+      meta_desc    TEXT,
+      content      TEXT,
+      word_count   INTEGER DEFAULT 0,
+      status       TEXT DEFAULT 'pending',
+      scheduled_at TIMESTAMPTZ,
+      images       JSONB,
+      error        TEXT,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ DEFAULT NOW()
+    );
 
-const syncArticles = db.transaction((months) => {
-  for (const [monthKey, monthData] of Object.entries(months || {})) {
+    CREATE INDEX IF NOT EXISTS idx_articles_month ON articles(month_key);
+  `);
+  console.log("[DB] PostgreSQL tables ready");
+};
+
+const syncArticles = async (months) => {
+  if (!months) return;
+  for (const [monthKey, monthData] of Object.entries(months)) {
     for (const a of (monthData.articles || [])) {
-      upsertArticle({
-        id: a.id, month_key: monthKey,
-        title: a.title || null, seo_title: a.seoTitle || null,
-        slug: a.slug || null, category: a.category || null,
-        keywords: a.keywords || null, meta_desc: a.metaDesc || null,
-        content: a.content || null, word_count: a.wordCount || 0,
-        status: a.status || "pending", scheduled_at: a.scheduledAt || null,
-        images: a.images ? JSON.stringify(a.images) : null,
-        error: a.error || null,
-      });
+      await pool.query(`
+        INSERT INTO articles
+          (id, month_key, title, seo_title, slug, category, keywords, meta_desc,
+           content, word_count, status, scheduled_at, images, error, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+        ON CONFLICT (id) DO UPDATE SET
+          title=$3, seo_title=$4, slug=$5, category=$6, keywords=$7, meta_desc=$8,
+          content=$9, word_count=$10, status=$11, scheduled_at=$12, images=$13,
+          error=$14, updated_at=NOW()
+      `, [
+        a.id, monthKey, a.title||null, a.seoTitle||null, a.slug||null,
+        a.category||null, a.keywords||null, a.metaDesc||null, a.content||null,
+        a.wordCount||0, a.status||"pending",
+        a.scheduledAt || null,
+        a.images ? JSON.stringify(a.images) : null,
+        a.error||null,
+      ]);
     }
   }
-});
+};
 
 // ── Middleware ───────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
 // ── API Routes ───────────────────────────────────────────────────
-app.get("/api/state", (req, res) => {
+app.get("/api/state", async (req, res) => {
   try {
-    const row = getState.get("app_state");
-    res.json(row ? JSON.parse(row.value) : {});
+    const { rows } = await pool.query("SELECT value FROM app_state WHERE key = 'main'");
+    res.json(rows[0]?.value || {});
   } catch (e) {
     console.error("[DB] read error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post("/api/state", (req, res) => {
+app.post("/api/state", async (req, res) => {
   try {
-    setState.run("app_state", JSON.stringify(req.body));
-    if (req.body.months) syncArticles(req.body.months);
+    await pool.query(`
+      INSERT INTO app_state (key, value, updated_at) VALUES ('main', $1, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+    `, [req.body]);
+    syncArticles(req.body.months).catch(e => console.error("[DB] sync error:", e.message));
     res.json({ ok: true });
   } catch (e) {
     console.error("[DB] write error:", e.message);
@@ -102,9 +100,13 @@ app.post("/api/state", (req, res) => {
   }
 });
 
-app.get("/api/health", (_req, res) => {
-  const { n } = db.prepare("SELECT COUNT(*) as n FROM articles").get();
-  res.json({ ok: true, env: process.env.NODE_ENV || "development", db: DB_PATH, articles: n });
+app.get("/api/health", async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT COUNT(*) as n FROM articles");
+    res.json({ ok: true, env: process.env.NODE_ENV || "development", articles: parseInt(rows[0].n) });
+  } catch (e) {
+    res.status(503).json({ ok: false, error: e.message });
+  }
 });
 
 // ── Serve React build in production ─────────────────────────────
@@ -115,6 +117,11 @@ if (isProd) {
 }
 
 // ── Start ────────────────────────────────────────────────────────
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[Blog Engine] ${isProd ? "Production" : "Dev"} server → http://0.0.0.0:${PORT}  DB: ${DB_PATH}`);
-});
+const start = async () => {
+  await initDB();
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[Blog Engine] ${isProd ? "Production" : "Dev"} → http://0.0.0.0:${PORT}`);
+  });
+};
+
+start().catch(e => { console.error("[FATAL]", e.message); process.exit(1); });
