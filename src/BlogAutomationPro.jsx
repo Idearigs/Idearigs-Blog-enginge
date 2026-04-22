@@ -264,8 +264,8 @@ export default function BlogAutomationPro() {
   const [selectedMonth, setSelectedMonth] = useState(null);
   const [selectedArticle, setSelectedArticle] = useState(null);
   const [config, setConfig] = useState({
-    geminiKey: import.meta.env.VITE_GEMINI_API_KEY || "",
-    geminiModel: "gemini-2.5-flash",
+    grokKey: import.meta.env.VITE_GROK_API_KEY || "",
+    grokModel: "grok-3-mini",
     unsplashKeys: [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean),
     pricePerMonth: 6000,
     currency: "Rs",
@@ -319,7 +319,7 @@ export default function BlogAutomationPro() {
   const logEndRef = useRef(null);
 
   useEffect(() => {
-    const DEPRECATED_MODELS = ["gemini-1.5-flash","gemini-1.5-flash-8b","gemini-1.5-pro","gemini-1.0-pro","gemini-3.1-flash","gemini-flash-latest","gemini-3-flash-preview","gemini-3.1-pro-preview","gemini-2.5-flash-preview-04-17","gemini-2.5-pro-preview-03-25","gemini-2.0-flash","gemini-2.0-flash-lite"];
+
     loadState().then(saved => {
       if (saved) {
         if (saved.months)   setMonths(saved.months);
@@ -333,8 +333,8 @@ export default function BlogAutomationPro() {
           if (!keys.length) keys = [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean);
           return {
             ...p, ...sc,
-            geminiKey: sc.geminiKey || import.meta.env.VITE_GEMINI_API_KEY || "",
-            geminiModel: DEPRECATED_MODELS.includes(sc.geminiModel) ? "gemini-2.5-flash" : (sc.geminiModel || "gemini-2.5-flash"),
+            grokKey: sc.grokKey || sc.geminiKey || import.meta.env.VITE_GROK_API_KEY || "",
+            grokModel: "grok-3-mini",
             unsplashKeys: keys,
             pricePerMonth: sc.pricePerMonth ?? 6000,
             currency: sc.currency || "Rs",
@@ -479,25 +479,23 @@ export default function BlogAutomationPro() {
   }, []);
 
   // ─── API ────────────────────────────────────────────────────
-  const geminiCall = async (prompt, retries = 2) => {
-    const model = config.geminiModel || "gemini-2.5-flash";
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.geminiKey}`,
-      { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ contents:[{ parts:[{ text:prompt }] }] }) }
-    );
+  const geminiCall = async (prompt, retries = 3) => {
+    const model = config.grokModel || "grok-3-mini";
+    const res = await fetch("https://api.x.ai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.grokKey}` },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
+    });
     const data = await res.json();
-    if (data.error) {
-      const msg = data.error.message || "";
-      // Extract retry delay from API message (e.g. "retry in 12.42433343s")
-      const retryMatch = msg.match(/retry in ([\d.]+)s/i);
-      const waitMs = retryMatch ? Math.ceil(parseFloat(retryMatch[1]) * 1000) + 500 : 15000;
-      if (retries > 0 && (res.status === 429 || msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("rate"))) {
-        await new Promise(r => setTimeout(r, waitMs));
+    if (!res.ok) {
+      const msg = data.error?.message || data.message || `HTTP ${res.status}`;
+      if (retries > 0 && res.status === 429) {
+        await new Promise(r => setTimeout(r, 15000));
         return geminiCall(prompt, retries - 1);
       }
       throw new Error(msg);
     }
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return data.choices?.[0]?.message?.content || "";
   };
 
   const pickRandomKeywords = (n = 3) => {
@@ -653,7 +651,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
 
   // ─── TEST ARTICLE ────────────────────────────────────────────
   const runTestArticle = async () => {
-    if (!config.geminiKey) { setTestLogs([{ msg:"Gemini API key not set — go to Settings first.", type:"error", ts:new Date().toLocaleTimeString() }]); return; }
+    if (!config.grokKey) { setTestLogs([{ msg:"Grok API key not set — go to Settings first.", type:"error", ts:new Date().toLocaleTimeString() }]); return; }
     const addTL = (msg, type="info") => setTestLogs(p => [...p, { msg, type, ts: new Date().toLocaleTimeString() }]);
     const topic = testUseCustom
       ? { title: testCustomTitle || "Sri Lanka Travel Guide", keywords: testCustomKeywords || "Sri Lanka travel", category: testCustomCategory }
@@ -688,7 +686,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
 
   // ─── PIPELINE ────────────────────────────────────────────────
   const runPipeline = async (monthKey) => {
-    if (!config.geminiKey) { addLog("⚠ Gemini API key not set — go to Settings.", "error"); return; }
+    if (!config.grokKey) { addLog("⚠ Grok API key not set — go to Settings.", "error"); return; }
     if (getPayment(monthKey).status !== "paid") { addLog("⚠ Mark month as PAID first.", "error"); return; }
     const monthData = months[monthKey];
     const site = monthData.siteId ? getSite(monthData.siteId) : null;
@@ -905,9 +903,9 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
               <p style={{ fontSize:13, color:C.muted, marginTop:4 }}>Manage your monthly blog automation workflow</p>
             </div>
 
-            {!config.geminiKey && (
+            {!config.grokKey && (
               <div style={{ background:"rgba(251,191,36,0.06)", border:"1px solid rgba(251,191,36,0.25)", borderRadius:12, padding:"14px 18px", marginBottom:16, display:"flex", gap:12, alignItems:"center" }}>
-                ⚠ <span style={{ fontSize:13, color:"#fde68a" }}>Gemini API key not set — <button onClick={() => setNav("settings")} style={{ background:"none", border:"none", color:C.teal, cursor:"pointer", fontSize:13, padding:"0 4px", textDecoration:"underline" }}>Settings</button></span>
+                ⚠ <span style={{ fontSize:13, color:"#fde68a" }}>Grok API key not set — <button onClick={() => setNav("settings")} style={{ background:"none", border:"none", color:C.teal, cursor:"pointer", fontSize:13, padding:"0 4px", textDecoration:"underline" }}>Settings</button></span>
               </div>
             )}
             {clients.length===0 && (
@@ -1346,11 +1344,12 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
-                <h3 style={{ margin:"0 0 16px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🤖 Gemini API</h3>
-                <Field label="API Key" value={config.geminiKey} onChange={v => setConfig(p=>({...p,geminiKey:v}))} type="password" placeholder="AIza..." mono hint="Get your free key at aistudio.google.com/apikey" />
-                <Select label="Model" value={config.geminiModel || "gemini-2.5-flash"} onChange={v => setConfig(p=>({...p,geminiModel:v}))}
+                <h3 style={{ margin:"0 0 16px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🤖 Grok AI (xAI)</h3>
+                <Field label="API Key" value={config.grokKey} onChange={v => setConfig(p=>({...p,grokKey:v}))} type="password" placeholder="xai-..." mono hint="Get your key at console.x.ai" />
+                <Select label="Model" value={config.grokModel || "grok-3-mini"} onChange={v => setConfig(p=>({...p,grokModel:v}))}
                   options={[
-                    { value:"gemini-2.5-flash", label:"gemini-2.5-flash  ← recommended (10 RPM / 500 RPD free)" },
+                    { value:"grok-3-mini",  label:"grok-3-mini  ← recommended (affordable, fast)" },
+                    { value:"grok-3",       label:"grok-3  (highest quality, higher cost)" },
                   ]} />
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
@@ -1385,7 +1384,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24, gridColumn:"1 / -1" }}>
                 <h3 style={{ margin:"0 0 6px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🎯 Target Keywords</h3>
                 <p style={{ fontSize:12, color:C.muted2, marginBottom:14, lineHeight:1.6 }}>
-                  These service keywords are randomly picked (2–3 per article) and naturally woven into content by Gemini. Great for SEO ranking on your core services.
+                  These service keywords are randomly picked (2–3 per article) and naturally woven into content by Grok. Great for SEO ranking on your core services.
                 </p>
                 <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
                   {targetKeywords.map((kw, i) => (
