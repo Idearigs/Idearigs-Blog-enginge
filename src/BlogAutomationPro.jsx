@@ -319,7 +319,7 @@ export default function BlogAutomationPro() {
   const logEndRef = useRef(null);
 
   useEffect(() => {
-    const DEPRECATED_MODELS = ["gemini-1.5-flash","gemini-1.5-flash-8b","gemini-1.5-pro","gemini-1.0-pro","gemini-3.1-flash","gemini-flash-latest","gemini-3-flash-preview","gemini-3.1-pro-preview"];
+    const DEPRECATED_MODELS = ["gemini-1.5-flash","gemini-1.5-flash-8b","gemini-1.5-pro","gemini-1.0-pro","gemini-3.1-flash","gemini-flash-latest","gemini-3-flash-preview","gemini-3.1-pro-preview","gemini-2.5-flash-preview-04-17","gemini-2.5-pro-preview-03-25"];
     loadState().then(saved => {
       if (saved) {
         if (saved.months)   setMonths(saved.months);
@@ -1350,10 +1350,8 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
                 <Field label="API Key" value={config.geminiKey} onChange={v => setConfig(p=>({...p,geminiKey:v}))} type="password" placeholder="AIza..." mono hint="Get your free key at aistudio.google.com/apikey" />
                 <Select label="Model" value={config.geminiModel || "gemini-2.0-flash"} onChange={v => setConfig(p=>({...p,geminiModel:v}))}
                   options={[
-                    { value:"gemini-2.0-flash",              label:"gemini-2.0-flash  ← recommended" },
-                    { value:"gemini-2.5-flash-preview-04-17",label:"gemini-2.5-flash-preview-04-17  (latest preview)" },
-                    { value:"gemini-2.0-flash-lite",         label:"gemini-2.0-flash-lite  (faster, cheaper)" },
-                    { value:"gemini-2.5-pro-preview-03-25",  label:"gemini-2.5-pro-preview  (highest quality)" },
+                    { value:"gemini-2.0-flash",     label:"gemini-2.0-flash  ← recommended (stable)" },
+                    { value:"gemini-2.0-flash-lite", label:"gemini-2.0-flash-lite  (faster, cheaper)" },
                   ]} />
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
