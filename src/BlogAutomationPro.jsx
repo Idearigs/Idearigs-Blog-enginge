@@ -254,6 +254,8 @@ export default function BlogAutomationPro() {
     currency: "Rs",
   });
   const [newUnsplashKey, setNewUnsplashKey] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsSavedMsg, setSettingsSavedMsg] = useState("");
   const [targetKeywords, setTargetKeywords] = useState([
     "Sri Lanka tour guide and driver",
     "Sri Lanka tour driver",
@@ -337,6 +339,23 @@ export default function BlogAutomationPro() {
 
   useEffect(() => { if (loaded) saveState({ months, clients, sites, config, payments, targetKeywords }); }, [months, clients, sites, config, payments, targetKeywords, loaded]);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior:"smooth" }); }, [logs]);
+
+  const saveSettings = async () => {
+    setSettingsSaving(true);
+    setSettingsSavedMsg("");
+    try {
+      await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ months, clients, sites, config, payments, targetKeywords }),
+      });
+      setSettingsSavedMsg("✓ Saved to database");
+    } catch {
+      setSettingsSavedMsg("✕ Save failed — check connection");
+    }
+    setSettingsSaving(false);
+    setTimeout(() => setSettingsSavedMsg(""), 3000);
+  };
 
   const addLog = useCallback((msg, type="info") => {
     setLogs(prev => [...prev, { msg, type, ts: new Date().toLocaleTimeString() }]);
@@ -1545,9 +1564,21 @@ ${a.content || "<p>No content generated yet.</p>"}
         {/* ── SETTINGS ── */}
         {nav==="settings" && (
           <div style={{ padding:32 }}>
-            <div style={{ marginBottom:28 }}>
-              <h1 style={{ fontSize:26, fontWeight:800, color:C.text, letterSpacing:"-0.03em" }}>Settings</h1>
-              <p style={{ fontSize:13, color:C.muted, marginTop:4 }}>Global API keys and configuration</p>
+            <div style={{ marginBottom:28, display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+              <div>
+                <h1 style={{ fontSize:26, fontWeight:800, color:C.text, letterSpacing:"-0.03em" }}>Settings</h1>
+                <p style={{ fontSize:13, color:C.muted, marginTop:4 }}>Global API keys and configuration</p>
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                {settingsSavedMsg && (
+                  <span style={{ fontSize:13, color: settingsSavedMsg.startsWith("✓") ? "#86efac" : "#fca5a5" }}>
+                    {settingsSavedMsg}
+                  </span>
+                )}
+                <Btn onClick={saveSettings} disabled={settingsSaving}>
+                  {settingsSaving ? "⏳ Saving…" : "💾 Save Settings"}
+                </Btn>
+              </div>
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
