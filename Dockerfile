@@ -18,12 +18,11 @@ RUN npm ci --omit=dev
 COPY server.js ./
 COPY --from=builder /app/dist ./dist
 
-ENV NODE_ENV=production
 ENV PORT=3000
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
-  CMD wget -qO- http://localhost:3000/api/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+  CMD node -e "require('http').get('http://localhost:3000/api/health', r => r.statusCode===200 ? process.exit(0) : process.exit(1)).on('error', () => process.exit(1))"
 
 CMD ["node", "server.js"]
