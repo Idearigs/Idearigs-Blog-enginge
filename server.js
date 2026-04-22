@@ -3,8 +3,7 @@ const cors    = require("cors");
 const path    = require("path");
 const { Pool } = require("pg");
 
-const isProd = process.env.NODE_ENV === "production";
-const PORT   = parseInt(process.env.PORT || (isProd ? "3000" : "3001"), 10);
+const PORT   = parseInt(process.env.PORT || "3000", 10);
 
 const app = express();
 
@@ -109,18 +108,20 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
-// ── Serve React build in production ─────────────────────────────
-if (isProd) {
-  const DIST = path.join(__dirname, "dist");
+// ── Serve React build if dist exists ────────────────────────────
+const fs   = require("fs");
+const DIST = path.join(__dirname, "dist");
+if (fs.existsSync(DIST)) {
   app.use(express.static(DIST));
   app.get("/{*path}", (_req, res) => res.sendFile(path.join(DIST, "index.html")));
+  console.log("[Blog Engine] Serving React build from /dist");
 }
 
 // ── Start ────────────────────────────────────────────────────────
 const start = async () => {
   await initDB();
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Blog Engine] ${isProd ? "Production" : "Dev"} → http://0.0.0.0:${PORT}`);
+    console.log(`[Blog Engine] → http://0.0.0.0:${PORT}  (NODE_ENV=${process.env.NODE_ENV || "unset"})`);
   });
 };
 
