@@ -265,7 +265,7 @@ export default function BlogAutomationPro() {
   const [selectedArticle, setSelectedArticle] = useState(null);
   const [config, setConfig] = useState({
     geminiKey: import.meta.env.VITE_GEMINI_API_KEY || "",
-    geminiModel: "gemini-2.0-flash",
+    geminiModel: "gemini-2.5-flash",
     unsplashKeys: [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean),
     pricePerMonth: 6000,
     currency: "Rs",
@@ -319,7 +319,7 @@ export default function BlogAutomationPro() {
   const logEndRef = useRef(null);
 
   useEffect(() => {
-    const DEPRECATED_MODELS = ["gemini-1.5-flash","gemini-1.5-flash-8b","gemini-1.5-pro","gemini-1.0-pro","gemini-3.1-flash","gemini-flash-latest","gemini-3-flash-preview","gemini-3.1-pro-preview","gemini-2.5-flash-preview-04-17","gemini-2.5-pro-preview-03-25"];
+    const DEPRECATED_MODELS = ["gemini-1.5-flash","gemini-1.5-flash-8b","gemini-1.5-pro","gemini-1.0-pro","gemini-3.1-flash","gemini-flash-latest","gemini-3-flash-preview","gemini-3.1-pro-preview","gemini-2.5-flash-preview-04-17","gemini-2.5-pro-preview-03-25","gemini-2.0-flash","gemini-2.0-flash-lite"];
     loadState().then(saved => {
       if (saved) {
         if (saved.months)   setMonths(saved.months);
@@ -334,7 +334,7 @@ export default function BlogAutomationPro() {
           return {
             ...p, ...sc,
             geminiKey: sc.geminiKey || import.meta.env.VITE_GEMINI_API_KEY || "",
-            geminiModel: DEPRECATED_MODELS.includes(sc.geminiModel) ? "gemini-2.0-flash" : (sc.geminiModel || "gemini-2.0-flash"),
+            geminiModel: DEPRECATED_MODELS.includes(sc.geminiModel) ? "gemini-2.5-flash" : (sc.geminiModel || "gemini-2.5-flash"),
             unsplashKeys: keys,
             pricePerMonth: sc.pricePerMonth ?? 6000,
             currency: sc.currency || "Rs",
@@ -480,7 +480,7 @@ export default function BlogAutomationPro() {
 
   // ─── API ────────────────────────────────────────────────────
   const geminiCall = async (prompt, retries = 2) => {
-    const model = config.geminiModel || "gemini-2.0-flash";
+    const model = config.geminiModel || "gemini-2.5-flash";
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.geminiKey}`,
       { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ contents:[{ parts:[{ text:prompt }] }] }) }
@@ -1348,10 +1348,9 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
                 <h3 style={{ margin:"0 0 16px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🤖 Gemini API</h3>
                 <Field label="API Key" value={config.geminiKey} onChange={v => setConfig(p=>({...p,geminiKey:v}))} type="password" placeholder="AIza..." mono hint="Get your free key at aistudio.google.com/apikey" />
-                <Select label="Model" value={config.geminiModel || "gemini-2.0-flash"} onChange={v => setConfig(p=>({...p,geminiModel:v}))}
+                <Select label="Model" value={config.geminiModel || "gemini-2.5-flash"} onChange={v => setConfig(p=>({...p,geminiModel:v}))}
                   options={[
-                    { value:"gemini-2.0-flash",     label:"gemini-2.0-flash  ← recommended (stable)" },
-                    { value:"gemini-2.0-flash-lite", label:"gemini-2.0-flash-lite  (faster, cheaper)" },
+                    { value:"gemini-2.5-flash", label:"gemini-2.5-flash  ← recommended (10 RPM / 500 RPD free)" },
                   ]} />
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
