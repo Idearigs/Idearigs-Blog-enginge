@@ -113,7 +113,7 @@ app.get("/api/health", async (_req, res) => {
 if (isProd) {
   const DIST = path.join(__dirname, "dist");
   app.use(express.static(DIST));
-  app.get("*", (_req, res) => res.sendFile(path.join(DIST, "index.html")));
+  app.get("/{*path}", (_req, res) => res.sendFile(path.join(DIST, "index.html")));
 }
 
 // ── Start ────────────────────────────────────────────────────────
