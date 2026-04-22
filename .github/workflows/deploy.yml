@@ -30,12 +30,15 @@ jobs:
 
       - name: Smoke test container
         run: |
-          docker run -d --name test-app -p 3000:3000 blog-engine:${{ github.sha }}
-          sleep 10
-          curl -f http://localhost:3000/api/health || (docker logs test-app && exit 1)
+          docker run -d --name test-app -p 3000:3000 \
+            -e NODE_ENV=production \
+            -e DATABASE_URL=postgresql://test:test@localhost:5432/test \
+            blog-engine:${{ github.sha }}
+          sleep 8
+          curl -f http://localhost:3000/ || (docker logs test-app && exit 1)
           docker rm -f test-app
 
-  # ── Deploy: trigger Coolify webhook on merge to main ────────────
+  # ── Deploy: trigger Coolify on merge to main ────────────────────
   deploy:
     name: Deploy to Coolify
     needs: build
@@ -44,8 +47,8 @@ jobs:
     steps:
       - name: Trigger Coolify deployment
         run: |
-          curl -X GET "${{ secrets.COOLIFY_WEBHOOK_URL }}" \
-            -H "Authorization: Bearer ${{ secrets.COOLIFY_WEBHOOK_TOKEN }}" \
+          curl -X GET "https://coolify.buymediamonds.co.uk/api/v1/deploy?uuid=m0kso0s8gskss0k04ccsowoc&force=false" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
             --fail \
             --silent \
             --show-error
