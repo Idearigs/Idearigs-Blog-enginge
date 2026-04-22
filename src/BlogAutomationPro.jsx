@@ -1346,25 +1346,27 @@ ${a.content || "<p>No content generated yet.</p>"}
                     {firstDate && <span style={{ fontSize:12, color:"#818cf8", background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", padding:"2px 10px", borderRadius:6 }}>📅 {new Date(firstDate).toLocaleDateString()} – {new Date(lastDate).toLocaleDateString()}</span>}
                   </div>
                 </div>
-                <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
-                  {pay.status !== "paid" && <Btn onClick={() => markPaid(selectedMonth)} variant="success">💰 Mark Paid</Btn>}
-                  <Btn onClick={() => runPipeline(selectedMonth)} disabled={isRunning || pay.status!=="paid"}>
-                    {isRunning ? "⏳ Running…" : pay.status!=="paid" ? "🔒 Pay First" : "▶ Run Pipeline"}
-                  </Btn>
-                  {!isRunning && arts.some(a => a.status==="error") && (
-                    <Btn onClick={() => runPipeline(selectedMonth)} variant="warn" disabled={pay.status!=="paid"}>
-                      🔁 Retry Failed ({arts.filter(a=>a.status==="error").length})
+                <div style={{ display:"flex", flexDirection:"column", gap:8, alignItems:"flex-end" }}>
+                  <div style={{ display:"flex", gap:8, flexWrap:"wrap", justifyContent:"flex-end" }}>
+                    {pay.status !== "paid" && <Btn onClick={() => markPaid(selectedMonth)} variant="success">💰 Mark Paid</Btn>}
+                    <Btn onClick={() => runPipeline(selectedMonth)} disabled={isRunning || pay.status!=="paid"}>
+                      {isRunning ? "⏳ Running…" : pay.status!=="paid" ? "🔒 Pay First" : "▶ Run Pipeline"}
                     </Btn>
-                  )}
-                  {!isRunning && arts.some(a => a.status==="ready") && (
-                    <Btn onClick={() => publishReadyArticles(selectedMonth)} variant="warn">
-                      📤 Publish Ready ({arts.filter(a=>a.status==="ready").length})
-                    </Btn>
-                  )}
+                    {!isRunning && arts.some(a => a.status==="error") && (
+                      <Btn onClick={() => runPipeline(selectedMonth)} variant="warn" disabled={pay.status!=="paid"}>
+                        🔁 Retry Failed ({arts.filter(a=>a.status==="error").length})
+                      </Btn>
+                    )}
+                    {!isRunning && arts.some(a => a.status==="ready") && (
+                      <Btn onClick={() => publishReadyArticles(selectedMonth)} variant="warn">
+                        📤 Publish Ready ({arts.filter(a=>a.status==="ready").length})
+                      </Btn>
+                    )}
+                    {isRunning && <Btn onClick={() => { abortRef.current=true; }} variant="danger">⛔ Stop</Btn>}
+                  </div>
                   {arts.some(a => a.content) && (
-                    <Btn onClick={() => downloadAllAsWord(selectedMonth)} variant="ghost">📥 Download as Word</Btn>
+                    <Btn onClick={() => downloadAllAsWord(selectedMonth)} variant="ghost">📥 Download All as Word (.zip)</Btn>
                   )}
-                  {isRunning && <Btn onClick={() => { abortRef.current=true; }} variant="danger">⛔ Stop</Btn>}
                 </div>
               </div>
 
