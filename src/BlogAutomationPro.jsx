@@ -504,6 +504,21 @@ export default function BlogAutomationPro() {
     return shuffled.slice(0, Math.min(n, shuffled.length));
   };
 
+  const parseAIJson = (text) => {
+    // Strip markdown fences
+    let clean = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+    // Remove control characters that break JSON.parse
+    clean = clean.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+    try {
+      return JSON.parse(clean);
+    } catch {
+      // Last resort: extract first {...} block
+      const match = clean.match(/\{[\s\S]*\}/);
+      if (match) return JSON.parse(match[0]);
+      throw new Error("AI returned invalid JSON — please retry");
+    }
+  };
+
   const generateSEOTitle = async (topic) => {
     const kws = pickRandomKeywords(2);
     const kwHint = kws.length ? `\nNaturally weave 1-2 of these service keywords into the meta description if relevant: ${kws.join(", ")}` : "";
@@ -511,7 +526,7 @@ export default function BlogAutomationPro() {
 Topic: "${topic.title}" | Keywords: ${topic.keywords}
 Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}
 Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescription":"..."}`);
-    return JSON.parse(text.replace(/```json|```/g, "").trim());
+    return parseAIJson(text);
   };
 
   const generateContent = async (topic) => {
@@ -525,7 +540,7 @@ Title: "${topic.seoTitle || topic.title}" | Keywords: ${topic.keywords} | Catego
 Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning Wonders of Lanka.${kwSection}
 Also generate 5 Unsplash image search queries (Sri Lanka travel photography).
 Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1","q2","q3","q4","q5"],"wordCount":2200}`);
-    return JSON.parse(text.replace(/```json|```/g, "").trim());
+    return parseAIJson(text);
   };
 
   // Per-key rate limit tracking: { keyIndex: resetTimestampMs }
@@ -702,11 +717,12 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     for (let i = 0; i < articles.length; i++) {
       if (abortRef.current) { addLog("⛔ Aborted.", "error"); break; }
       const a = articles[i];
-      addLog(`\n── [${i+1}/10] "${a.title}"`);
+      if (a.status !== "pending" && a.status !== "error") continue;
+      addLog(`\n── [${i+1}/10] "${a.title}"${a.status==="error" ? " (retrying)" : ""}`);
 
       // SEO Title
       try {
-        updateArticle(monthKey, a.id, { status:"title_gen" });
+        updateArticle(monthKey, a.id, { status:"title_gen", error:null });
         addLog("  Generating SEO title…");
         const td = await generateSEOTitle(a);
         updateArticle(monthKey, a.id, { seoTitle:td.seoTitle, slug:td.slug, metaDesc:td.metaDescription });
@@ -828,6 +844,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       ghost:   { background:"rgba(255,255,255,0.04)", color:C.muted, border:`1px solid ${C.border}` },
       danger:  { background:"rgba(239,68,68,0.1)", color:"#fca5a5", border:"1px solid rgba(239,68,68,0.25)" },
       success: { background:"rgba(34,197,94,0.1)", color:"#86efac", border:"1px solid rgba(34,197,94,0.25)" },
+      warn:    { background:"rgba(251,146,60,0.1)", color:"#fdba74", border:"1px solid rgba(251,146,60,0.25)" },
     };
     const s = styles[variant] || styles.primary;
     return (
@@ -1171,11 +1188,16 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
                     {firstDate && <span style={{ fontSize:12, color:"#818cf8", background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", padding:"2px 10px", borderRadius:6 }}>📅 {new Date(firstDate).toLocaleDateString()} – {new Date(lastDate).toLocaleDateString()}</span>}
                   </div>
                 </div>
-                <div style={{ display:"flex", gap:8 }}>
+                <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
                   {pay.status !== "paid" && <Btn onClick={() => markPaid(selectedMonth)} variant="success">💰 Mark Paid</Btn>}
                   <Btn onClick={() => runPipeline(selectedMonth)} disabled={isRunning || pay.status!=="paid"}>
                     {isRunning ? "⏳ Running…" : pay.status!=="paid" ? "🔒 Pay First" : "▶ Run Pipeline"}
                   </Btn>
+                  {!isRunning && arts.some(a => a.status==="error") && (
+                    <Btn onClick={() => runPipeline(selectedMonth)} variant="warn" disabled={pay.status!=="paid"}>
+                      🔁 Retry Failed ({arts.filter(a=>a.status==="error").length})
+                    </Btn>
+                  )}
                   {isRunning && <Btn onClick={() => { abortRef.current=true; }} variant="danger">⛔ Stop</Btn>}
                 </div>
               </div>
