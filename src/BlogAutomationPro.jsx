@@ -655,6 +655,29 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       if (catId) categories.push(catId);
     }
 
+    // Upload first image as featured image
+    let featuredMediaId = null;
+    const firstImage = article.images?.[0];
+    if (firstImage?.url) {
+      try {
+        const slug = article.slug || "article";
+        const uploadRes = await fetch("/api/wp/upload-image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: site.url, user: site.user, appPass: site.appPass,
+            imageUrl: firstImage.url,
+            filename: `${slug}-featured.jpg`,
+            alt: firstImage.alt || article.seoTitle || article.title,
+          }),
+        });
+        if (uploadRes.ok) {
+          const media = await uploadRes.json();
+          featuredMediaId = media.id;
+        }
+      } catch { /* featured image is optional — don't fail the whole post */ }
+    }
+
     const post = {
       title: article.seoTitle || article.title,
       content: article.content,
@@ -662,6 +685,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       slug: article.slug,
       excerpt: article.metaDesc,
       ...(categories.length && { categories }),
+      ...(featuredMediaId && { featured_media: featuredMediaId }),
     };
     if (isFuture) post.date = scheduledAt;
 

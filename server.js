@@ -143,6 +143,44 @@ app.post("/api/wp/post", async (req, res) => {
   }
 });
 
+app.post("/api/wp/upload-image", async (req, res) => {
+  const { url, user, appPass, imageUrl, filename, alt } = req.body;
+  if (!url || !user || !appPass || !imageUrl) return res.status(400).json({ error: "url, user, appPass, imageUrl required" });
+  try {
+    const base = url.replace(/\/$/, "");
+    const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
+    // Fetch the image bytes from Unsplash/external URL
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) return res.status(502).json({ error: `Could not fetch image: ${imgRes.status}` });
+    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+    const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+    const fname = filename || "featured-image.jpg";
+    // Upload to WP media library
+    const uploadRes = await fetch(`${base}/wp-json/wp/v2/media`, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        "Content-Disposition": `attachment; filename="${fname}"`,
+        "Content-Type": contentType,
+      },
+      body: imgBuffer,
+    });
+    const mediaData = await uploadRes.json();
+    if (!uploadRes.ok) return res.status(uploadRes.status).json({ error: mediaData.message || `HTTP ${uploadRes.status}` });
+    // Set alt text
+    if (alt) {
+      await fetch(`${base}/wp-json/wp/v2/media/${mediaData.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: auth },
+        body: JSON.stringify({ alt_text: alt }),
+      });
+    }
+    res.json({ id: mediaData.id, url: mediaData.source_url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/wp/category", async (req, res) => {
   const { url, user, appPass, name } = req.body;
   try {
