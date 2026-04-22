@@ -399,28 +399,13 @@ export default function BlogAutomationPro() {
     }
     setSiteConnStatus("testing"); setSiteConnMsg("");
     try {
-      const base = siteForm.url.replace(/\/$/, "").replace(/\/wp-admin.*$/, "");
-      // Strip spaces from application password (WP sometimes shows it with spaces)
-      const appPass = siteForm.appPass.replace(/\s+/g, "");
-      const endpoint = `${base}/wp-json/wp/v2/users/me`;
-      let res;
-      try {
-        res = await fetch(endpoint, {
-          headers: { Authorization: "Basic " + btoa(`${siteForm.user}:${appPass}`) }
-        });
-      } catch (networkErr) {
-        const isHttps = base.startsWith("https");
-        if (!isHttps) throw new Error("CORS blocked — your site must use HTTPS for Application Passwords.");
-        throw new Error(`Network error — CORS blocked. Add CORS headers to WordPress functions.php (see guide).`);
-      }
-      if (res.status === 401) throw new Error("401 Unauthorized — wrong username or application password.");
-      if (res.status === 403) throw new Error("403 Forbidden — user may not have publish permissions.");
-      if (res.status === 404) throw new Error(`404 Not Found — REST API may be disabled. Check: ${base}/wp-json/`);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.message || `HTTP ${res.status}`);
-      }
+      const res = await fetch("/api/wp/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: siteForm.url, user: siteForm.user, appPass: siteForm.appPass }),
+      });
       const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       setSiteConnStatus("connected");
       setSiteConnMsg(`Connected as: ${data.name} (${data.roles?.join(", ")})`);
     } catch (err) {
@@ -612,43 +597,24 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
   const wpCatCache = useRef({});
 
   const getOrCreateWPCategory = async (site, categoryName) => {
-    const base = site.url.replace(/\/$/, "");
-    const auth = "Basic " + btoa(`${site.user}:${site.appPass}`);
     const cache = wpCatCache.current[site.id] || {};
-
     if (cache[categoryName]) return cache[categoryName];
 
-    // Search for existing category
-    const search = await fetch(`${base}/wp-json/wp/v2/categories?search=${encodeURIComponent(categoryName)}&per_page=10`, {
-      headers: { Authorization: auth }
-    });
-    if (search.ok) {
-      const list = await search.json();
-      const match = list.find(c => c.name.toLowerCase() === categoryName.toLowerCase());
-      if (match) {
-        wpCatCache.current[site.id] = { ...cache, [categoryName]: match.id };
-        return match.id;
-      }
-    }
-
-    // Create it
-    const create = await fetch(`${base}/wp-json/wp/v2/categories`, {
+    const res = await fetch("/api/wp/category", {
       method: "POST",
-      headers: { "Content-Type":"application/json", Authorization: auth },
-      body: JSON.stringify({ name: categoryName }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, name: categoryName }),
     });
-    if (create.ok) {
-      const newCat = await create.json();
-      wpCatCache.current[site.id] = { ...cache, [categoryName]: newCat.id };
-      return newCat.id;
+    const data = await res.json();
+    if (data.id) {
+      wpCatCache.current[site.id] = { ...cache, [categoryName]: data.id };
+      return data.id;
     }
     return null;
   };
 
-  // WordPress publish/schedule — uses WP REST API with Application Password auth
+  // WordPress publish/schedule — proxied through Express to avoid CORS
   const publishToWP = async (site, article) => {
-    const base = site.url.replace(/\/$/, "");
-    const auth = "Basic " + btoa(`${site.user}:${site.appPass}`);
     const scheduledAt = article.scheduledAt;
     const now = new Date();
     const pubDate = scheduledAt ? new Date(scheduledAt) : null;
@@ -661,7 +627,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       if (catId) categories.push(catId);
     }
 
-    const body = {
+    const post = {
       title: article.seoTitle || article.title,
       content: article.content,
       status: isFuture ? "future" : "publish",
@@ -669,16 +635,16 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       excerpt: article.metaDesc,
       ...(categories.length && { categories }),
     };
-    if (isFuture) body.date = scheduledAt;
+    if (isFuture) post.date = scheduledAt;
 
-    const res = await fetch(`${base}/wp-json/wp/v2/posts`, {
+    const res = await fetch("/api/wp/post", {
       method: "POST",
-      headers: { "Content-Type":"application/json", Authorization: auth },
-      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, post }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(err.message || `WordPress API ${res.status}`);
+      throw new Error(err.message || err.error || `WordPress API ${res.status}`);
     }
     return res.json();
   };

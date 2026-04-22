@@ -108,6 +108,64 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+// ── WordPress Proxy (avoids browser CORS) ───────────────────────
+app.post("/api/wp/test", async (req, res) => {
+  const { url, user, appPass } = req.body;
+  if (!url || !user || !appPass) return res.status(400).json({ error: "url, user, appPass required" });
+  try {
+    const base = url.replace(/\/$/, "").replace(/\/wp-admin.*$/, "");
+    const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
+    const r = await fetch(`${base}/wp-json/wp/v2/users/me`, { headers: { Authorization: auth } });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: data.message || `HTTP ${r.status}` });
+    res.json({ ok: true, name: data.name, roles: data.roles });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/wp/post", async (req, res) => {
+  const { url, user, appPass, post } = req.body;
+  if (!url || !user || !appPass) return res.status(400).json({ error: "url, user, appPass required" });
+  try {
+    const base = url.replace(/\/$/, "");
+    const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
+    const r = await fetch(`${base}/wp-json/wp/v2/posts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: JSON.stringify(post),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: data.message || `HTTP ${r.status}` });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/wp/category", async (req, res) => {
+  const { url, user, appPass, name } = req.body;
+  try {
+    const base = url.replace(/\/$/, "");
+    const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
+    // Search first
+    const search = await fetch(`${base}/wp-json/wp/v2/categories?search=${encodeURIComponent(name)}&per_page=10`, { headers: { Authorization: auth } });
+    const list = await search.json();
+    const match = Array.isArray(list) && list.find(c => c.name.toLowerCase() === name.toLowerCase());
+    if (match) return res.json({ id: match.id });
+    // Create
+    const create = await fetch(`${base}/wp-json/wp/v2/categories`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: JSON.stringify({ name }),
+    });
+    const cat = await create.json();
+    res.json({ id: cat.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Serve React build if dist exists ────────────────────────────
 const fs   = require("fs");
 const DIST = path.join(__dirname, "dist");
