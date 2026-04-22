@@ -1,36 +1,18 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
-const STORAGE_KEY = "wol-blog-automation-v3";
-
 const loadState = async () => {
-  let fromServer = null;
-  let fromLocal = null;
   try {
     const res = await fetch("/api/state");
-    if (res.ok) { const d = await res.json(); if (d && Object.keys(d).length > 0) fromServer = d; }
+    if (res.ok) {
+      const d = await res.json();
+      if (d && Object.keys(d).length > 0) return d;
+    }
   } catch {}
-  try { const r = localStorage.getItem(STORAGE_KEY); if (r) fromLocal = JSON.parse(r); } catch {}
-
-  // If server has data, use it (source of truth)
-  if (fromServer) {
-    // Also keep localStorage in sync
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(fromServer)); } catch {}
-    return fromServer;
-  }
-  // Server empty but localStorage has data — push localStorage up to server
-  if (fromLocal) {
-    try {
-      await fetch("/api/state", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(fromLocal) });
-    } catch {}
-    return fromLocal;
-  }
   return null;
 };
 
 const saveState = (s) => {
-  // Always write to both — localStorage is the instant backup
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch {}
   fetch("/api/state", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(s) }).catch(() => {});
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -446,7 +428,7 @@ export default function BlogAutomationPro() {
   const markPaid = (k) => setPayments(p => p.map(x => x.monthKey===k ? { ...x, status:"paid", paidAt:new Date().toISOString() } : x));
 
   const exportData = () => {
-    const data = { months, clients, sites, payments, config, exportedAt: new Date().toISOString(), version: STORAGE_KEY };
+    const data = { months, clients, sites, payments, config, exportedAt: new Date().toISOString(), version: "wol-blog-automation-v3" };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type:"application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1633,8 +1615,8 @@ ${a.content || "<p>No content generated yet.</p>"}
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24, gridColumn:"1 / -1" }}>
                 <h3 style={{ margin:"0 0 6px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>💾 Data Backup</h3>
                 <p style={{ fontSize:12, color:C.muted2, marginBottom:16, lineHeight:1.6 }}>
-                  All data (clients, sites, months, payments, articles) is saved in <strong style={{ color:C.muted }}>browser localStorage</strong>.
-                  Export a JSON backup regularly — if you clear browser data, everything is lost.
+                  All data is stored in <strong style={{ color:C.muted }}>PostgreSQL</strong> on your VPS — safe across browser clears and redeployments.
+                  Export a JSON backup as an extra safety net.
                 </p>
                 <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
                   <Btn onClick={exportData}>↓ Export Backup</Btn>
@@ -1642,14 +1624,11 @@ ${a.content || "<p>No content generated yet.</p>"}
                     ↑ Import Backup
                     <input type="file" accept=".json" onChange={importData} style={{ display:"none" }} />
                   </label>
-                  <span style={{ fontSize:11, color:C.muted2 }}>
-                    Last save: {new Date().toLocaleDateString()} · Storage key: <code style={{ color:C.teal, fontSize:10 }}>{STORAGE_KEY}</code>
-                  </span>
                 </div>
               </div>
               <div style={{ background:C.card, border:"1px solid rgba(239,68,68,0.15)", borderRadius:14, padding:24 }}>
                 <h3 style={{ margin:"0 0 10px", fontSize:13, color:"#f87171", fontWeight:600 }}>Danger Zone</h3>
-                <Btn onClick={() => { if (confirm("Delete ALL data? This cannot be undone.")) { setMonths({}); setPayments([]); setSites([]); setClients([]); setLogs([]); fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); localStorage.removeItem(STORAGE_KEY); } }} variant="danger">Reset All Data</Btn>
+                <Btn onClick={() => { if (confirm("Delete ALL data? This cannot be undone.")) { setMonths({}); setPayments([]); setSites([]); setClients([]); setLogs([]); fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); } }} variant="danger">Reset All Data</Btn>
               </div>
             </div>
           </div>
