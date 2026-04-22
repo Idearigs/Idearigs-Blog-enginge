@@ -1,0 +1,51 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── CI: verify the build works ──────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build React
+        run: npm run build
+
+      - name: Build Docker image
+        run: docker build -t blog-engine:${{ github.sha }} .
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name test-app -p 3000:3000 blog-engine:${{ github.sha }}
+          sleep 10
+          curl -f http://localhost:3000/api/health || (docker logs test-app && exit 1)
+          docker rm -f test-app
+
+  # ── Deploy: trigger Coolify webhook on merge to main ────────────
+  deploy:
+    name: Deploy to Coolify
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Trigger Coolify deployment
+        run: |
+          curl -X GET "${{ secrets.COOLIFY_WEBHOOK_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_WEBHOOK_TOKEN }}" \
+            --fail \
+            --silent \
+            --show-error
