@@ -259,6 +259,7 @@ export default function BlogAutomationPro() {
   const [loaded, setLoaded] = useState(false);
   const [nav, setNav] = useState("dashboard");
   const [months, setMonths] = useState({});
+  const monthsRef = useRef({});
   const [clients, setClients] = useState([]);
   const [sites, setSites] = useState([]);
   const [selectedMonth, setSelectedMonth] = useState(null);
@@ -314,6 +315,11 @@ export default function BlogAutomationPro() {
   const [nmSiteId, setNmSiteId] = useState("");
   const [nmStartDate, setNmStartDate] = useState(tomorrow());
   const [nmTime, setNmTime] = useState("09:00");
+  const [nmLanguage, setNmLanguage] = useState("en");
+
+  // Corrected doc upload state
+  const [uploadingDocs, setUploadingDocs] = useState(false);
+  const [uploadResults, setUploadResults] = useState([]);
 
   const abortRef = useRef(false);
   const logEndRef = useRef(null);
@@ -428,6 +434,7 @@ export default function BlogAutomationPro() {
       articles, createdAt: new Date().toISOString(),
       clientId: nmClientId, siteId: nmSiteId,
       scheduleStartDate: nmStartDate, scheduleTime: nmTime,
+      language: nmLanguage,
     }}));
     const price = clients.find(c => c.id===nmClientId)?.pricePerMonth || config.pricePerMonth;
     setPayments(p => [...p, { monthKey:nmDate, status:"unpaid", amount:price, paidAt:null, clientId:nmClientId }]);
@@ -472,10 +479,14 @@ export default function BlogAutomationPro() {
   const getClient = (id) => clients.find(c => c.id===id);
 
   const updateArticle = useCallback((monthKey, articleId, updates) => {
-    setMonths(prev => ({
-      ...prev,
-      [monthKey]: { ...prev[monthKey], articles: prev[monthKey].articles.map(a => a.id===articleId ? { ...a, ...updates } : a) }
-    }));
+    setMonths(prev => {
+      const next = {
+        ...prev,
+        [monthKey]: { ...prev[monthKey], articles: prev[monthKey].articles.map(a => a.id===articleId ? { ...a, ...updates } : a) }
+      };
+      monthsRef.current = next;
+      return next;
+    });
   }, []);
 
   // ─── API ────────────────────────────────────────────────────
@@ -519,26 +530,30 @@ export default function BlogAutomationPro() {
     }
   };
 
-  const generateSEOTitle = async (topic) => {
+  const LANG_NAMES = { en:"English", it:"Italian", de:"German", fr:"French", es:"Spanish" };
+
+  const generateSEOTitle = async (topic, lang = "en") => {
     const kws = pickRandomKeywords(2);
     const kwHint = kws.length ? `\nNaturally weave 1-2 of these service keywords into the meta description if relevant: ${kws.join(", ")}` : "";
+    const langLine = lang !== "en" ? `\nWRITE EVERYTHING IN ${LANG_NAMES[lang] || lang.toUpperCase()} — title, slug (latin chars), and meta description.` : "";
     const text = await geminiCall(`You are an SEO expert for "Wonders of Lanka" (wondersoflanka.com), a Sri Lanka tour guide agency.
 Topic: "${topic.title}" | Keywords: ${topic.keywords}
-Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}
+Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}${langLine}
 Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescription":"..."}`);
     return parseAIJson(text);
   };
 
-  const generateContent = async (topic) => {
+  const generateContent = async (topic, lang = "en") => {
     const kws = pickRandomKeywords(3);
     const kwSection = kws.length
       ? `\nService keywords to naturally include 1-2 times each (do NOT stuff — weave them in naturally as anchor text or in context): ${kws.map(k => `"${k}"`).join(", ")}`
       : "";
+    const langLine = lang !== "en" ? `\nCRITICAL: Write the ENTIRE article in ${LANG_NAMES[lang] || lang} — all headings, paragraphs, FAQ, and CTA must be in ${LANG_NAMES[lang] || lang}.` : "";
     const text = await geminiCall(`You are a professional travel blog writer for "Wonders of Lanka" (wondersoflanka.com), a premium Sri Lanka tour guide and driver service in Sri Lanka.
 Write a comprehensive SEO-optimized blog article.
 Title: "${topic.seoTitle || topic.title}" | Keywords: ${topic.keywords} | Category: ${topic.category}
-Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning Wonders of Lanka.${kwSection}
-Also generate 5 Unsplash image search queries (Sri Lanka travel photography).
+Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning Wonders of Lanka.${kwSection}${langLine}
+Also generate 5 Unsplash image search queries IN ENGLISH (Sri Lanka travel photography).
 Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1","q2","q3","q4","q5"],"wordCount":2200}`);
     return parseAIJson(text);
   };
@@ -704,6 +719,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     if (!config.grokKey) { addLog("⚠ Grok API key not set — go to Settings.", "error"); return; }
     if (getPayment(monthKey).status !== "paid") { addLog("⚠ Mark month as PAID first.", "error"); return; }
     const monthData = months[monthKey];
+    const lang = monthData.language || "en";
     const site = monthData.siteId ? getSite(monthData.siteId) : null;
     abortRef.current = false;
     setIsRunning(true);
@@ -724,7 +740,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       try {
         updateArticle(monthKey, a.id, { status:"title_gen", error:null });
         addLog("  Generating SEO title…");
-        const td = await generateSEOTitle(a);
+        const td = await generateSEOTitle(a, lang);
         updateArticle(monthKey, a.id, { seoTitle:td.seoTitle, slug:td.slug, metaDesc:td.metaDescription });
         addLog(`  ✓ "${td.seoTitle}"`, "success");
       } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); continue; }
@@ -735,8 +751,8 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       try {
         updateArticle(monthKey, a.id, { status:"content_gen" });
         addLog("  Writing 2000+ word article…");
-        const freshA = months[monthKey]?.articles.find(x => x.id===a.id) || a;
-        const cd = await generateContent(freshA);
+        const freshA = (monthsRef.current[monthKey] || months[monthKey])?.articles.find(x => x.id===a.id) || a;
+        const cd = await generateContent(freshA, lang);
         addLog(`  ✓ ~${cd.wordCount||2000} words written`, "success");
 
         updateArticle(monthKey, a.id, { status:"images" });
@@ -750,7 +766,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     // Publish / Schedule to WP
     if (!abortRef.current && site?.user && site?.appPass) {
       addLog("\n── Submitting to WordPress…", "success");
-      const current = months[monthKey].articles;
+      const current = (monthsRef.current[monthKey] || months[monthKey]).articles;
       for (let i = 0; i < current.length; i++) {
         if (abortRef.current) break;
         const a = current[i];
@@ -814,6 +830,119 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     setMonths(p => { const n = { ...p }; delete n[monthKey]; return n; });
     setPayments(p => p.filter(x => x.monthKey !== monthKey));
     if (selectedMonth === monthKey) { setSelectedMonth(null); setNav("dashboard"); }
+  };
+
+  // ─── PUBLISH READY (recheck) ─────────────────────────────────
+  const publishReadyArticles = async (monthKey) => {
+    const monthData = months[monthKey];
+    const site = monthData?.siteId ? getSite(monthData.siteId) : null;
+    if (!site?.user || !site?.appPass) { addLog("⚠ No WordPress site linked.", "error"); return; }
+    const readyArts = monthData.articles.filter(a => a.status === "ready");
+    if (!readyArts.length) { addLog("No ready articles to publish.", "warn"); return; }
+    setIsRunning(true);
+    addLog(`\n── Publishing ${readyArts.length} ready article(s) to WordPress…`, "success");
+    for (const a of readyArts) {
+      if (abortRef.current) break;
+      try {
+        updateArticle(monthKey, a.id, { status:"publishing" });
+        const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
+        const isFuture = dt && dt > new Date();
+        addLog(`  ${isFuture ? `📅 Scheduling ${dt.toLocaleDateString()}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
+        await publishToWP(site, a);
+        updateArticle(monthKey, a.id, { status:"published" });
+        addLog(`  ✓ Done!`, "success");
+        await new Promise(r => setTimeout(r, 500));
+      } catch (err) {
+        updateArticle(monthKey, a.id, { status:"ready", error:err.message });
+        addLog(`  ✕ ${err.message}`, "error");
+      }
+    }
+    setIsRunning(false);
+    saveState();
+  };
+
+  // ─── DOWNLOAD ALL AS WORD ────────────────────────────────────
+  const downloadAllAsWord = async (monthKey) => {
+    const JSZip = (await import("jszip")).default;
+    const monthData = months[monthKey];
+    if (!monthData) return;
+    const zip = new JSZip();
+    const label = getMonthLabel(monthKey);
+
+    monthData.articles.forEach((a, i) => {
+      if (!a.content && !a.seoTitle) return;
+      const num = String(i + 1).padStart(2, "0");
+      const slug = a.slug || `article-${num}`;
+      const scheduledStr = a.scheduledAt ? `Scheduled: ${new Date(a.scheduledAt).toLocaleDateString()}` : "";
+
+      const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+<head><meta charset='utf-8'>
+<style>
+  body { font-family: Calibri, Arial, sans-serif; font-size: 12pt; line-height: 1.6; margin: 2cm; }
+  h1 { font-size: 20pt; color: #1a365d; margin-bottom: 6pt; }
+  h2 { font-size: 15pt; color: #2c5282; margin-top: 18pt; }
+  h3 { font-size: 13pt; color: #2b6cb0; }
+  .meta { background: #f7fafc; border: 1px solid #bee3f8; padding: 10pt; margin-bottom: 18pt; font-size: 10pt; }
+  .meta strong { color: #2c5282; }
+  img { max-width: 100%; }
+</style>
+</head>
+<body>
+<h1>${a.seoTitle || a.title || "Article"}</h1>
+<div class="meta">
+  <strong>Slug:</strong> ${a.slug || ""}<br>
+  <strong>Category:</strong> ${a.category || ""}<br>
+  <strong>Keywords:</strong> ${a.keywords || ""}<br>
+  <strong>Meta Description:</strong> ${a.metaDesc || ""}<br>
+  <strong>${scheduledStr}</strong>
+</div>
+${a.content || "<p>No content generated yet.</p>"}
+</body></html>`;
+
+      zip.file(`${num}-${slug}.doc`, "﻿" + html);
+    });
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `WOL-Articles-${label.replace(/\s/g,"-")}.zip`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ─── UPLOAD CORRECTED DOCS ───────────────────────────────────
+  const handleCorrectedDocsUpload = async (monthKey, files) => {
+    const mammoth = await import("mammoth");
+    const monthData = months[monthKey];
+    if (!monthData) return;
+    setUploadingDocs(true);
+    setUploadResults([]);
+    const results = [];
+
+    for (const file of Array.from(files)) {
+      // Match by filename prefix e.g. "01-slug.docx" → article index 0
+      const match = file.name.match(/^(\d+)/);
+      const idx = match ? parseInt(match[1], 10) - 1 : -1;
+      const article = monthData.articles[idx];
+      if (!article) {
+        results.push({ file: file.name, ok: false, msg: "Could not match to an article (name must start with 01-, 02-, etc.)" });
+        continue;
+      }
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.convertToHtml({ arrayBuffer });
+        const html = result.value;
+        updateArticle(monthKey, article.id, { content: html, status: "ready", error: null });
+        results.push({ file: file.name, ok: true, msg: `→ Article #${idx+1}: "${article.seoTitle || article.title}"` });
+      } catch (err) {
+        results.push({ file: file.name, ok: false, msg: err.message });
+      }
+    }
+
+    setUploadResults(results);
+    setUploadingDocs(false);
+    saveState();
   };
 
   if (!loaded) return (
@@ -1185,6 +1314,11 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
                     <PayBadge status={pay.status} />
                     {client && <span style={{ fontSize:12, color:"#d8b4fe", background:"rgba(192,132,252,0.08)", border:"1px solid rgba(192,132,252,0.2)", padding:"2px 10px", borderRadius:6 }}>👤 {client.name}</span>}
                     {site && <span style={{ fontSize:12, color:"#7dd3fc", background:"rgba(56,189,248,0.08)", border:"1px solid rgba(56,189,248,0.2)", padding:"2px 10px", borderRadius:6 }}>🔗 {site.name}</span>}
+                    {months[selectedMonth]?.language && months[selectedMonth].language !== "en" && (
+                      <span style={{ fontSize:12, color:"#fde68a", background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.2)", padding:"2px 10px", borderRadius:6 }}>
+                        🌍 {LANG_NAMES[months[selectedMonth].language]}
+                      </span>
+                    )}
                     {firstDate && <span style={{ fontSize:12, color:"#818cf8", background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", padding:"2px 10px", borderRadius:6 }}>📅 {new Date(firstDate).toLocaleDateString()} – {new Date(lastDate).toLocaleDateString()}</span>}
                   </div>
                 </div>
@@ -1198,11 +1332,54 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
                       🔁 Retry Failed ({arts.filter(a=>a.status==="error").length})
                     </Btn>
                   )}
+                  {!isRunning && arts.some(a => a.status==="ready") && (
+                    <Btn onClick={() => publishReadyArticles(selectedMonth)} variant="warn">
+                      📤 Publish Ready ({arts.filter(a=>a.status==="ready").length})
+                    </Btn>
+                  )}
+                  {arts.some(a => a.content) && (
+                    <Btn onClick={() => downloadAllAsWord(selectedMonth)} variant="ghost">📥 Download as Word</Btn>
+                  )}
                   {isRunning && <Btn onClick={() => { abortRef.current=true; }} variant="danger">⛔ Stop</Btn>}
                 </div>
               </div>
 
               {(isRunning || logs.length > 0) && <PipelineVisualizer articles={arts} logs={logs} isRunning={isRunning} logEndRef={logEndRef} />}
+
+              {/* Upload corrected docs (non-English months) */}
+              {months[selectedMonth]?.language && months[selectedMonth].language !== "en" && (
+                <div style={{ background:C.card, border:`1px solid rgba(129,140,248,0.3)`, borderRadius:14, padding:20, marginBottom:20 }}>
+                  <div style={{ fontSize:13, fontWeight:700, color:"#a5b4fc", marginBottom:6 }}>
+                    📂 Upload Corrected Word Docs ({LANG_NAMES[months[selectedMonth].language]} articles)
+                  </div>
+                  <p style={{ fontSize:12, color:C.muted, marginBottom:12, lineHeight:1.6 }}>
+                    After auditing the downloaded Word files, upload the corrected <code>.docx</code> files here.
+                    Files must start with the article number (e.g. <code>01-slug.docx</code>, <code>02-slug.docx</code>).
+                    The corrected content will replace the article and it will be ready to schedule to WordPress.
+                  </p>
+                  <label style={{ display:"inline-block", padding:"9px 18px", background:"rgba(129,140,248,0.12)", border:"1px solid rgba(129,140,248,0.3)", borderRadius:9, color:"#a5b4fc", fontSize:13, fontWeight:600, cursor:"pointer" }}>
+                    {uploadingDocs ? "Uploading…" : "Choose .docx files"}
+                    <input type="file" accept=".docx" multiple style={{ display:"none" }} disabled={uploadingDocs}
+                      onChange={e => handleCorrectedDocsUpload(selectedMonth, e.target.files)} />
+                  </label>
+                  {uploadResults.length > 0 && (
+                    <div style={{ marginTop:12, display:"flex", flexDirection:"column", gap:4 }}>
+                      {uploadResults.map((r, i) => (
+                        <div key={i} style={{ fontSize:12, color: r.ok ? "#86efac" : "#fca5a5" }}>
+                          {r.ok ? "✓" : "✕"} <strong>{r.file}</strong> — {r.msg}
+                        </div>
+                      ))}
+                      {uploadResults.some(r => r.ok) && (
+                        <div style={{ marginTop:8 }}>
+                          <Btn onClick={() => publishReadyArticles(selectedMonth)} disabled={isRunning}>
+                            📅 Schedule Corrected Articles to WordPress
+                          </Btn>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Schedule timeline */}
               {arts.some(a => a.scheduledAt) && (
@@ -1684,6 +1861,14 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
             <p style={{ fontSize:12, color:C.muted, marginBottom:22 }}>10 articles will be assigned and scheduled 1 per day with a gap day between each (every 2 days).</p>
 
             <Field label="Month (YYYY-MM)" value={nmDate} onChange={setNmDate} placeholder="2026-05" mono />
+            <Select label="Article Language" value={nmLanguage} onChange={setNmLanguage}
+              options={[
+                { value:"en", label:"🇬🇧 English" },
+                { value:"it", label:"🇮🇹 Italian" },
+                { value:"de", label:"🇩🇪 German" },
+                { value:"fr", label:"🇫🇷 French" },
+                { value:"es", label:"🇪🇸 Spanish" },
+              ]} />
             <Select label="Client" value={nmClientId} onChange={v => { setNmClientId(v); setNmSiteId(""); }}
               options={[{ value:"", label:"— No client —" }, ...clients.map(c => ({ value:c.id, label:c.name }))]} />
             <Select label="WordPress Site" value={nmSiteId} onChange={setNmSiteId}
