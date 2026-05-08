@@ -517,18 +517,29 @@ export default function BlogAutomationPro() {
   };
 
   const parseAIJson = (text) => {
-    // Strip markdown fences
     let clean = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
     // Remove control characters that break JSON.parse
     clean = clean.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-    try {
-      return JSON.parse(clean);
-    } catch {
-      // Last resort: extract first {...} block
-      const match = clean.match(/\{[\s\S]*\}/);
-      if (match) return JSON.parse(match[0]);
-      throw new Error("AI returned invalid JSON — please retry");
+
+    const tryParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
+    // 1. Try as-is
+    let result = tryParse(clean);
+    if (result) return result;
+
+    // 2. Fix invalid escape sequences — AI sometimes emits \c, \s, \2022 etc. inside HTML content
+    const fixEscapes = (s) => s.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+    result = tryParse(fixEscapes(clean));
+    if (result) return result;
+
+    // 3. Extract first {...} block and retry both ways
+    const match = clean.match(/\{[\s\S]*\}/);
+    if (match) {
+      result = tryParse(match[0]) || tryParse(fixEscapes(match[0]));
+      if (result) return result;
     }
+
+    throw new Error("AI returned invalid JSON — please retry");
   };
 
   const LANG_NAMES = { en:"English", it:"Italian", de:"German", fr:"French", es:"Spanish" };
@@ -886,6 +897,25 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
   };
 
   // ─── DOWNLOAD ALL AS WORD ────────────────────────────────────
+  const embedImagesAsBase64 = async (html) => {
+    const matches = [...html.matchAll(/<img([^>]*?)src="(https?:\/\/[^"]+)"([^>]*?)>/gi)];
+    let result = html;
+    for (const m of matches) {
+      try {
+        const res = await fetch(m[2]);
+        if (!res.ok) continue;
+        const blob = await res.blob();
+        const b64 = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        });
+        result = result.replace(m[2], b64);
+      } catch { /* keep original URL if fetch fails */ }
+    }
+    return result;
+  };
+
   const downloadAllAsWord = async (monthKey) => {
     const JSZip = (await import("jszip")).default;
     const monthData = months[monthKey];
@@ -893,11 +923,14 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     const zip = new JSZip();
     const label = getMonthLabel(monthKey);
 
-    monthData.articles.forEach((a, i) => {
-      if (!a.content && !a.seoTitle) return;
+    for (let i = 0; i < monthData.articles.length; i++) {
+      const a = monthData.articles[i];
+      if (!a.content && !a.seoTitle) continue;
       const num = String(i + 1).padStart(2, "0");
       const slug = a.slug || `article-${num}`;
       const scheduledStr = a.scheduledAt ? `Scheduled: ${new Date(a.scheduledAt).toLocaleDateString()}` : "";
+
+      const embeddedContent = a.content ? await embedImagesAsBase64(a.content) : "<p>No content generated yet.</p>";
 
       const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
 <head><meta charset='utf-8'>
@@ -920,11 +953,11 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
   <strong>Meta Description:</strong> ${a.metaDesc || ""}<br>
   <strong>${scheduledStr}</strong>
 </div>
-${a.content || "<p>No content generated yet.</p>"}
+${embeddedContent}
 </body></html>`;
 
       zip.file(`${num}-${slug}.doc`, "﻿" + html);
-    });
+    }
 
     const blob = await zip.generateAsync({ type: "blob" });
     const url = URL.createObjectURL(blob);
