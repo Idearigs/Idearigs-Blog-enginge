@@ -883,7 +883,6 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       }
     }
     setIsRunning(false);
-    saveState();
   };
 
   // ─── DOWNLOAD ALL AS WORD ────────────────────────────────────
@@ -967,7 +966,6 @@ ${a.content || "<p>No content generated yet.</p>"}
 
     setUploadResults(results);
     setUploadingDocs(false);
-    saveState();
   };
 
   if (!loaded) return (
