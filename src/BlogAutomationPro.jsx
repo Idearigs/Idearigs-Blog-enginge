@@ -1,9 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
+let _appKey = (() => { try { return sessionStorage.getItem("blog_app_key") || ""; } catch { return ""; } })();
+const setAppKey = (k) => { _appKey = k; try { sessionStorage.setItem("blog_app_key", k); } catch {} };
+const authHeader = () => _appKey ? { "x-app-key": _appKey } : {};
+
 const loadState = async () => {
   try {
-    const res = await fetch("/api/state");
+    const res = await fetch("/api/state", { headers: authHeader() });
+    if (res.status === 401) return { __locked: true };
     if (res.ok) {
       const d = await res.json();
       if (d && Object.keys(d).length > 0) return d;
@@ -13,7 +18,7 @@ const loadState = async () => {
 };
 
 const saveState = (s) => {
-  fetch("/api/state", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(s) }).catch(() => {});
+  fetch("/api/state", { method:"POST", headers:{"Content-Type":"application/json", ...authHeader()}, body:JSON.stringify(s) }).catch(() => {});
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -238,6 +243,9 @@ const PipelineVisualizer = ({ articles, logs, isRunning, logEndRef }) => {
 
 // ─── MAIN ────────────────────────────────────────────────────────
 export default function BlogAutomationPro() {
+  const [locked, setLocked] = useState(false);
+  const [loginPass, setLoginPass] = useState("");
+  const [loginError, setLoginError] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [nav, setNav] = useState("dashboard");
   const [months, setMonths] = useState({});
@@ -308,34 +316,53 @@ export default function BlogAutomationPro() {
   const abortRef = useRef(false);
   const logEndRef = useRef(null);
 
-  useEffect(() => {
+  const applyState = (saved) => {
+    if (!saved) return;
+    if (saved.months)        setMonths(saved.months);
+    if (saved.clients)       setClients(saved.clients);
+    if (saved.sites)         setSites(saved.sites);
+    if (saved.config)        setConfig(p => {
+      const sc = saved.config;
+      let keys = sc.unsplashKeys || [];
+      if (!keys.length && sc.unsplashAccessKey) keys = [sc.unsplashAccessKey];
+      if (!keys.length) keys = [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean);
+      return {
+        ...p, ...sc,
+        grokKey: sc.grokKey || sc.geminiKey || import.meta.env.VITE_GROK_API_KEY || "",
+        grokModel: "grok-3-mini",
+        unsplashKeys: keys,
+        pricePerMonth: sc.pricePerMonth ?? 6000,
+        currency: sc.currency || "Rs",
+      };
+    });
+    if (saved.payments)      setPayments(saved.payments);
+    if (saved.targetKeywords) setTargetKeywords(saved.targetKeywords);
+  };
 
+  useEffect(() => {
     loadState().then(saved => {
-      if (saved) {
-        if (saved.months)   setMonths(saved.months);
-        if (saved.clients)  setClients(saved.clients);
-        if (saved.sites)    setSites(saved.sites);
-        if (saved.config)   setConfig(p => {
-          const sc = saved.config;
-          // migrate old single unsplashAccessKey → unsplashKeys array
-          let keys = sc.unsplashKeys || [];
-          if (!keys.length && sc.unsplashAccessKey) keys = [sc.unsplashAccessKey];
-          if (!keys.length) keys = [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean);
-          return {
-            ...p, ...sc,
-            grokKey: sc.grokKey || sc.geminiKey || import.meta.env.VITE_GROK_API_KEY || "",
-            grokModel: "grok-3-mini",
-            unsplashKeys: keys,
-            pricePerMonth: sc.pricePerMonth ?? 6000,
-            currency: sc.currency || "Rs",
-          };
-        });
-        if (saved.payments)        setPayments(saved.payments);
-        if (saved.targetKeywords)  setTargetKeywords(saved.targetKeywords);
-      }
+      if (saved?.__locked) { setLocked(true); setLoaded(true); return; }
+      applyState(saved);
       setLoaded(true);
     });
   }, []);
+
+  const doLogin = async () => {
+    setLoginError("");
+    try {
+      const res = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: loginPass }),
+      });
+      if (!res.ok) { setLoginError("Wrong password. Try again."); return; }
+      setAppKey(loginPass);
+      setLocked(false);
+      loadState().then(saved => { applyState(saved); setLoaded(true); });
+    } catch {
+      setLoginError("Connection error. Is the server running?");
+    }
+  };
 
   useEffect(() => { if (loaded) saveState({ months, clients, sites, config, payments, targetKeywords }); }, [months, clients, sites, config, payments, targetKeywords, loaded]);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior:"smooth" }); }, [logs]);
@@ -346,7 +373,7 @@ export default function BlogAutomationPro() {
     try {
       await fetch("/api/state", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeader() },
         body: JSON.stringify({ months, clients, sites, config, payments, targetKeywords }),
       });
       setSettingsSavedMsg("✓ Saved to database");
@@ -360,6 +387,10 @@ export default function BlogAutomationPro() {
   const addLog = useCallback((msg, type="info") => {
     setLogs(prev => [...prev, { msg, type, ts: new Date().toLocaleTimeString() }]);
   }, []);
+
+  const updateMonthSite = (monthKey, siteId) => {
+    setMonths(p => ({ ...p, [monthKey]: { ...p[monthKey], siteId } }));
+  };
 
   // ─── CLIENTS ────────────────────────────────────────────────
   const openAddClient = () => { setEditingClientId(null); setClientForm({ name:"", email:"", phone:"", website:"", notes:"" }); setShowClientModal(true); };
@@ -408,7 +439,7 @@ export default function BlogAutomationPro() {
     try {
       const res = await fetch("/api/wp/test", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeader() },
         body: JSON.stringify({ url: siteForm.url, user: siteForm.user, appPass: siteForm.appPass }),
       });
       const data = await res.json();
@@ -642,7 +673,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
 
     const res = await fetch("/api/wp/category", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeader() },
       body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, name: categoryName }),
     });
     const data = await res.json();
@@ -675,7 +706,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         const slug = article.slug || "article";
         const uploadRes = await fetch("/api/wp/upload-image", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authHeader() },
           body: JSON.stringify({
             url: site.url, user: site.user, appPass: site.appPass,
             imageUrl: firstImage.url,
@@ -703,7 +734,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
 
     const res = await fetch("/api/wp/post", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeader() },
       body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, post }),
     });
     if (!res.ok) {
@@ -1000,6 +1031,29 @@ ${embeddedContent}
     setUploadResults(results);
     setUploadingDocs(false);
   };
+
+  if (locked) return (
+    <div style={{ height:"100vh", background:C.bg, display:"flex", alignItems:"center", justifyContent:"center" }}>
+      <div style={{ width:340, background:C.surface, border:`1px solid ${C.border2}`, borderRadius:20, padding:36 }}>
+        <div style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:"-0.03em" }}>Blog Engine</div>
+        <div style={{ fontSize:13, color:C.muted, marginBottom:28 }}>Enter your password to continue</div>
+        <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:500, letterSpacing:"0.05em", textTransform:"uppercase" }}>Password</label>
+        <input
+          type="password"
+          value={loginPass}
+          onChange={e => setLoginPass(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && doLogin()}
+          placeholder="••••••••"
+          autoFocus
+          style={{ width:"100%", padding:"10px 14px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:10, color:C.text, fontSize:14, outline:"none", boxSizing:"border-box", marginBottom:loginError ? 8 : 16 }}
+        />
+        {loginError && <div style={{ fontSize:12, color:"#f87171", marginBottom:12 }}>{loginError}</div>}
+        <button onClick={doLogin} style={{ width:"100%", padding:"11px", background:C.teal, border:"none", borderRadius:10, color:"#000", fontSize:14, fontWeight:700, cursor:"pointer" }}>
+          Unlock
+        </button>
+      </div>
+    </div>
+  );
 
   if (!loaded) return (
     <div style={{ height:"100vh", background:C.bg, display:"flex", alignItems:"center", justifyContent:"center" }}>
@@ -1369,7 +1423,15 @@ ${embeddedContent}
                   <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:6, flexWrap:"wrap" }}>
                     <PayBadge status={pay.status} />
                     {client && <span style={{ fontSize:12, color:"#d8b4fe", background:"rgba(192,132,252,0.08)", border:"1px solid rgba(192,132,252,0.2)", padding:"2px 10px", borderRadius:6 }}>👤 {client.name}</span>}
-                    {site && <span style={{ fontSize:12, color:"#7dd3fc", background:"rgba(56,189,248,0.08)", border:"1px solid rgba(56,189,248,0.2)", padding:"2px 10px", borderRadius:6 }}>🔗 {site.name}</span>}
+                    <select
+                      value={md.siteId || ""}
+                      onChange={e => updateMonthSite(selectedMonth, e.target.value)}
+                      title="Change WordPress site"
+                      style={{ fontSize:12, color: md.siteId ? "#7dd3fc" : "#f87171", background: md.siteId ? "rgba(56,189,248,0.08)" : "rgba(239,68,68,0.08)", border:`1px solid ${md.siteId ? "rgba(56,189,248,0.2)" : "rgba(239,68,68,0.3)"}`, padding:"2px 8px", borderRadius:6, cursor:"pointer", outline:"none" }}
+                    >
+                      <option value="">⚠ No site linked</option>
+                      {sites.map(s => <option key={s.id} value={s.id}>🔗 {s.name}</option>)}
+                    </select>
                     {months[selectedMonth]?.language && months[selectedMonth].language !== "en" && (
                       <span style={{ fontSize:12, color:"#fde68a", background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.2)", padding:"2px 10px", borderRadius:6 }}>
                         🌍 {LANG_NAMES[months[selectedMonth].language]}
@@ -1690,7 +1752,7 @@ ${embeddedContent}
               </div>
               <div style={{ background:C.card, border:"1px solid rgba(239,68,68,0.15)", borderRadius:14, padding:24 }}>
                 <h3 style={{ margin:"0 0 10px", fontSize:13, color:"#f87171", fontWeight:600 }}>Danger Zone</h3>
-                <Btn onClick={() => { if (confirm("Delete ALL data? This cannot be undone.")) { setMonths({}); setPayments([]); setSites([]); setClients([]); setLogs([]); fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); } }} variant="danger">Reset All Data</Btn>
+                <Btn onClick={() => { if (confirm("Delete ALL data? This cannot be undone.")) { setMonths({}); setPayments([]); setSites([]); setClients([]); setLogs([]); fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json",...authHeader()},body:"{}"}); } }} variant="danger">Reset All Data</Btn>
               </div>
             </div>
           </div>

@@ -74,6 +74,23 @@ const syncArticles = async (months) => {
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
+// ── Auth ─────────────────────────────────────────────────────────
+const AUTH_PASS = process.env.APP_PASSWORD;
+
+// Login endpoint — exempt from auth check
+app.post("/api/auth", (req, res) => {
+  if (!AUTH_PASS) return res.json({ ok: true });
+  if (req.body?.password === AUTH_PASS) return res.json({ ok: true });
+  res.status(401).json({ error: "Wrong password" });
+});
+
+// Protect all other /api routes
+app.use("/api", (req, res, next) => {
+  if (!AUTH_PASS) return next();
+  if (req.headers["x-app-key"] === AUTH_PASS) return next();
+  res.status(401).json({ error: "Unauthorized" });
+});
+
 // ── API Routes ───────────────────────────────────────────────────
 app.get("/api/state", async (req, res) => {
   try {
