@@ -152,13 +152,13 @@ app.post("/api/wp/post", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
       body: JSON.stringify(post),
-      signal: AbortSignal.timeout(25000),
+      signal: AbortSignal.timeout(90000),
     });
     const data = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: data.message || `HTTP ${r.status}` });
     res.json(data);
   } catch (e) {
-    const msg = e.name === "TimeoutError" ? "WordPress did not respond within 25s" : e.message;
+    const msg = e.name === "TimeoutError" ? "WordPress did not respond within 90s — check site connectivity" : e.message;
     res.status(e.name === "TimeoutError" ? 504 : 500).json({ error: msg });
   }
 });

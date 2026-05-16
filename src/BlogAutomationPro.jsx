@@ -745,7 +745,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     if (isFuture) post.date_gmt = scheduledAt;
 
     const ctrl = new AbortController();
-    const tmo = setTimeout(() => ctrl.abort(), 30000);
+    const tmo = setTimeout(() => ctrl.abort(), 95000);
     try {
       const res = await fetch("/api/wp/post", {
         method: "POST",
@@ -761,7 +761,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       return res.json();
     } catch (err) {
       clearTimeout(tmo);
-      if (err.name === "AbortError") throw new Error("WordPress did not respond within 30s — check site connectivity");
+      if (err.name === "AbortError") throw new Error("WordPress did not respond within 90s — check site connectivity");
       throw err;
     }
   };
