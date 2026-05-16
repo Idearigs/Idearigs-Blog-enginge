@@ -152,12 +152,14 @@ app.post("/api/wp/post", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
       body: JSON.stringify(post),
+      signal: AbortSignal.timeout(25000),
     });
     const data = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: data.message || `HTTP ${r.status}` });
     res.json(data);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const msg = e.name === "TimeoutError" ? "WordPress did not respond within 25s" : e.message;
+    res.status(e.name === "TimeoutError" ? 504 : 500).json({ error: msg });
   }
 });
 
@@ -167,13 +169,13 @@ app.post("/api/wp/upload-image", async (req, res) => {
   try {
     const base = url.replace(/\/$/, "");
     const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
-    // Fetch the image bytes from Unsplash/external URL
-    const imgRes = await fetch(imageUrl);
+    // Fetch image bytes from Unsplash with a 15s timeout
+    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(15000) });
     if (!imgRes.ok) return res.status(502).json({ error: `Could not fetch image: ${imgRes.status}` });
     const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
     const contentType = imgRes.headers.get("content-type") || "image/jpeg";
     const fname = filename || "featured-image.jpg";
-    // Upload to WP media library
+    // Upload to WP media library with a 30s timeout
     const uploadRes = await fetch(`${base}/wp-json/wp/v2/media`, {
       method: "POST",
       headers: {
@@ -182,20 +184,23 @@ app.post("/api/wp/upload-image", async (req, res) => {
         "Content-Type": contentType,
       },
       body: imgBuffer,
+      signal: AbortSignal.timeout(30000),
     });
     const mediaData = await uploadRes.json();
     if (!uploadRes.ok) return res.status(uploadRes.status).json({ error: mediaData.message || `HTTP ${uploadRes.status}` });
-    // Set alt text
+    // Set alt text (best-effort, no timeout needed)
     if (alt) {
       await fetch(`${base}/wp-json/wp/v2/media/${mediaData.id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: auth },
         body: JSON.stringify({ alt_text: alt }),
-      });
+        signal: AbortSignal.timeout(10000),
+      }).catch(() => {});
     }
     res.json({ id: mediaData.id, url: mediaData.source_url });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const msg = e.name === "TimeoutError" ? "Image upload timed out" : e.message;
+    res.status(e.name === "TimeoutError" ? 504 : 500).json({ error: msg });
   }
 });
 

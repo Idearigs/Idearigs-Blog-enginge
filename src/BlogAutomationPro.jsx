@@ -685,7 +685,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
   };
 
   // WordPress publish/schedule — proxied through Express to avoid CORS
-  const publishToWP = async (site, article) => {
+  const publishToWP = async (site, article, logFn) => {
     const scheduledAt = article.scheduledAt;
     const now = new Date();
     const pubDate = scheduledAt ? new Date(scheduledAt) : null;
@@ -702,23 +702,34 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     let featuredMediaId = null;
     const firstImage = article.images?.[0];
     if (firstImage?.url) {
+      logFn?.(`  📸 Uploading featured image…`);
+      const ctrl = new AbortController();
+      const tmo = setTimeout(() => ctrl.abort(), 35000);
       try {
-        const slug = article.slug || "article";
         const uploadRes = await fetch("/api/wp/upload-image", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeader() },
           body: JSON.stringify({
             url: site.url, user: site.user, appPass: site.appPass,
             imageUrl: firstImage.url,
-            filename: `${slug}-featured.jpg`,
+            filename: `${article.slug || "article"}-featured.jpg`,
             alt: firstImage.alt || article.seoTitle || article.title,
           }),
+          signal: ctrl.signal,
         });
+        clearTimeout(tmo);
         if (uploadRes.ok) {
           const media = await uploadRes.json();
           featuredMediaId = media.id;
+          logFn?.(`  ✓ Featured image set (id: ${featuredMediaId})`, "success");
+        } else {
+          const err = await uploadRes.json().catch(() => ({}));
+          logFn?.(`  ⚠ Featured image failed: ${err.error || uploadRes.status}`, "warn");
         }
-      } catch { /* featured image is optional — don't fail the whole post */ }
+      } catch (err) {
+        clearTimeout(tmo);
+        logFn?.(`  ⚠ Featured image ${err.name === "AbortError" ? "timed out (skipped)" : `error: ${err.message}`}`, "warn");
+      }
     }
 
     const post = {
@@ -730,18 +741,29 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       ...(categories.length && { categories }),
       ...(featuredMediaId && { featured_media: featuredMediaId }),
     };
-    if (isFuture) post.date = scheduledAt;
+    // Use date_gmt so WordPress treats the time as UTC regardless of site timezone
+    if (isFuture) post.date_gmt = scheduledAt;
 
-    const res = await fetch("/api/wp/post", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeader() },
-      body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, post }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.message || err.error || `WordPress API ${res.status}`);
+    const ctrl = new AbortController();
+    const tmo = setTimeout(() => ctrl.abort(), 30000);
+    try {
+      const res = await fetch("/api/wp/post", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader() },
+        body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, post }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(tmo);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || err.error || `WordPress API ${res.status}`);
+      }
+      return res.json();
+    } catch (err) {
+      clearTimeout(tmo);
+      if (err.name === "AbortError") throw new Error("WordPress did not respond within 30s — check site connectivity");
+      throw err;
     }
-    return res.json();
   };
 
   useEffect(() => { testLogEndRef.current?.scrollIntoView({ behavior:"smooth" }); }, [testLogs]);
@@ -843,7 +865,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
           const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
           const isFuture = dt && dt > new Date();
           addLog(`  ${isFuture ? `📅 Scheduling ${dt.toLocaleDateString()} ${dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
-          await publishToWP(site, a);
+          await publishToWP(site, a, addLog);
           updateArticle(monthKey, a.id, { status:"published" });
           addLog(`  ✓ ${isFuture ? "Scheduled!" : "Published!"}`, "success");
           await new Promise(r => setTimeout(r, 500));
@@ -915,7 +937,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
         const isFuture = dt && dt > new Date();
         addLog(`  ${isFuture ? `📅 Scheduling ${dt.toLocaleDateString()}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
-        await publishToWP(site, a);
+        await publishToWP(site, a, addLog);
         updateArticle(monthKey, a.id, { status:"published" });
         addLog(`  ✓ Done!`, "success");
         await new Promise(r => setTimeout(r, 500));
