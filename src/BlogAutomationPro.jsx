@@ -445,7 +445,7 @@ export default function BlogAutomationPro() {
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       setSiteConnStatus("connected");
-      setSiteConnMsg(`Connected as: ${data.name} (${data.roles?.join(", ")})`);
+      setSiteConnMsg(`Connected as: ${data.name}${data.roles?.length ? ` (${data.roles.join(", ")})` : ""}`);
     } catch (err) {
       setSiteConnStatus("error");
       setSiteConnMsg(err.message);
