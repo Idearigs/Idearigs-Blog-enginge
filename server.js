@@ -84,9 +84,10 @@ app.post("/api/auth", (req, res) => {
   res.status(401).json({ error: "Wrong password" });
 });
 
-// Protect all other /api routes
+// Protect all other /api routes (health check is exempt so Coolify/Docker can probe it)
 app.use("/api", (req, res, next) => {
   if (!AUTH_PASS) return next();
+  if (req.path === "/health") return next();
   if (req.headers["x-app-key"] === AUTH_PASS) return next();
   res.status(401).json({ error: "Unauthorized" });
 });
