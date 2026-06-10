@@ -65,7 +65,7 @@ const CAT = {
 const STEPS = [
   { id: "title_gen",   icon: "✦", label: "SEO Title",  desc: "Generating optimized title & slug" },
   { id: "content_gen", icon: "✎", label: "Content",    desc: "Writing 2000+ word article" },
-  { id: "images",      icon: "⬡", label: "Images",     desc: "Fetching 3–5 Unsplash photos" },
+  { id: "images",      icon: "⬡", label: "Images",     desc: "Fetching 4–5 Unsplash photos" },
   { id: "publishing",  icon: "↑", label: "Scheduling", desc: "Pushing to WordPress" },
 ];
 
@@ -111,14 +111,15 @@ const insertImagesIntoContent = (html, images) => {
 // ─── SMALL COMPONENTS ────────────────────────────────────────────
 const StatusDot = ({ status }) => {
   const map = {
-    pending:     { color: "#475569", label: "Pending" },
-    title_gen:   { color: "#818cf8", label: "SEO Title…", spin: true },
-    content_gen: { color: "#38bdf8", label: "Writing…",   spin: true },
-    images:      { color: "#c084fc", label: "Images…",    spin: true },
-    ready:       { color: "#22c55e", label: "Ready" },
-    publishing:  { color: "#fbbf24", label: "Scheduling…",spin: true },
-    published:   { color: "#14b8a6", label: "Scheduled ✓" },
-    error:       { color: "#f87171", label: "Error" },
+    pending:      { color: "#475569", label: "Pending" },
+    title_gen:    { color: "#818cf8", label: "SEO Title…",  spin: true },
+    content_gen:  { color: "#38bdf8", label: "Writing…",    spin: true },
+    images:       { color: "#c084fc", label: "Images…",     spin: true },
+    ready:        { color: "#22c55e", label: "Ready" },
+    publishing:   { color: "#fbbf24", label: "Publishing…", spin: true },
+    published:    { color: "#14b8a6", label: "Scheduled ✓" },
+    published_now:{ color: "#38bdf8", label: "Published ✓" },
+    error:        { color: "#f87171", label: "Error" },
   };
   const s = map[status] || map.pending;
   return (
@@ -510,6 +511,17 @@ export default function BlogAutomationPro() {
   const getSite = (id) => sites.find(s => s.id===id);
   const getClient = (id) => clients.find(c => c.id===id);
 
+  // Resolve the brand (company name + website) that AI-generated content should reference.
+  // Prefers the linked client, falls back to the linked site, then to a default.
+  const getBrand = (monthData) => {
+    const site = monthData?.siteId ? getSite(monthData.siteId) : null;
+    const client = monthData?.clientId ? getClient(monthData.clientId) : (site?.clientId ? getClient(site.clientId) : null);
+    const name = client?.name || site?.name || "Wonders of Lanka";
+    const rawWebsite = client?.website || site?.url || "wondersoflanka.com";
+    const website = rawWebsite.replace(/^https?:\/\//, "").replace(/\/$/, "");
+    return { name, website };
+  };
+
   const updateArticle = useCallback((monthKey, articleId, updates) => {
     setMonths(prev => {
       const next = {
@@ -574,28 +586,30 @@ export default function BlogAutomationPro() {
   };
 
   const LANG_NAMES = { en:"English", it:"Italian", de:"German", fr:"French", es:"Spanish" };
+  const DEFAULT_BRAND = { name: "Wonders of Lanka", website: "wondersoflanka.com" };
 
-  const generateSEOTitle = async (topic, lang = "en") => {
+  const generateSEOTitle = async (topic, lang = "en", brand = DEFAULT_BRAND) => {
     const kws = pickRandomKeywords(2);
     const kwHint = kws.length ? `\nNaturally weave 1-2 of these service keywords into the meta description if relevant: ${kws.join(", ")}` : "";
     const langLine = lang !== "en" ? `\nWRITE EVERYTHING IN ${LANG_NAMES[lang] || lang.toUpperCase()} — title, slug (latin chars), and meta description.` : "";
-    const text = await geminiCall(`You are an SEO expert for "Wonders of Lanka" (wondersoflanka.com), a Sri Lanka tour guide agency.
+    const text = await geminiCall(`You are an SEO expert for "${brand.name}" (${brand.website}), a Sri Lanka tour and travel agency.
 Topic: "${topic.title}" | Keywords: ${topic.keywords}
 Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}${langLine}
 Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescription":"..."}`);
     return parseAIJson(text);
   };
 
-  const generateContent = async (topic, lang = "en") => {
+  const generateContent = async (topic, lang = "en", brand = DEFAULT_BRAND) => {
     const kws = pickRandomKeywords(3);
     const kwSection = kws.length
       ? `\nService keywords to naturally include 1-2 times each (do NOT stuff — weave them in naturally as anchor text or in context): ${kws.map(k => `"${k}"`).join(", ")}`
       : "";
     const langLine = lang !== "en" ? `\nCRITICAL: Write the ENTIRE article in ${LANG_NAMES[lang] || lang} — all headings, paragraphs, FAQ, and CTA must be in ${LANG_NAMES[lang] || lang}.` : "";
-    const text = await geminiCall(`You are a professional travel blog writer for "Wonders of Lanka" (wondersoflanka.com), a premium Sri Lanka tour guide and driver service in Sri Lanka.
+    const text = await geminiCall(`You are a professional travel blog writer for "${brand.name}" (${brand.website}), a premium Sri Lanka tour and travel agency.
 Write a comprehensive SEO-optimized blog article.
 Title: "${topic.seoTitle || topic.title}" | Keywords: ${topic.keywords} | Category: ${topic.category}
-Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning Wonders of Lanka.${kwSection}${langLine}
+Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning ${brand.name}.${kwSection}${langLine}
+IMPORTANT: This article is for "${brand.name}" (${brand.website}) ONLY. Do NOT mention "Wonders of Lanka", "wondersoflanka.com", or any other tour/travel company name — use ONLY "${brand.name}" / "${brand.website}" wherever a brand, company, or website is referenced.
 Also generate 5 Unsplash image search queries IN ENGLISH (Sri Lanka travel photography).
 Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1","q2","q3","q4","q5"],"wordCount":2200}`);
     return parseAIJson(text);
@@ -604,7 +618,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
   // Per-key rate limit tracking: { keyIndex: resetTimestampMs }
   const unsplashKeyLimits = useRef({});
 
-  const fetchOneImage = async (query, logFn) => {
+  const fetchOneImage = async (query, logFn, usedIds) => {
     const keys = (config.unsplashKeys || []).filter(Boolean);
     if (!keys.length) return null;
 
@@ -629,7 +643,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
 
     const key = keys[chosenIdx];
     try {
-      const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query+" Sri Lanka")}&per_page=5&orientation=landscape`, {
+      const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query+" Sri Lanka")}&per_page=15&orientation=landscape`, {
         headers: { Authorization: `Client-ID ${key}` }
       });
       const remaining = parseInt(res.headers.get("X-Ratelimit-Remaining") ?? "99");
@@ -638,26 +652,41 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         const resetAt = new Date(); resetAt.setHours(resetAt.getHours()+1, 0, 10, 0);
         unsplashKeyLimits.current[chosenIdx] = resetAt.getTime();
         logFn && logFn(`  ⚠ Key ${chosenIdx+1}/${keys.length} rate limited — switching key…`, "warn");
-        return fetchOneImage(query, logFn); // retry with next available key
+        return fetchOneImage(query, logFn, usedIds); // retry with next available key
       }
 
       if (remaining <= 8) logFn && logFn(`  ⚠ Key ${chosenIdx+1}: only ${remaining} requests left this hour`, "warn");
       const data = await res.json();
-      if (data.results?.length > 0) {
-        const pick = data.results[Math.floor(Math.random() * Math.min(5, data.results.length))];
+      const all = data.results || [];
+      // Prefer high-resolution, not-yet-used-in-this-article photos; relax filters if nothing matches
+      let candidates = all.filter(r => (r.width||0) >= 1600 && !usedIds.has(r.id));
+      if (!candidates.length) candidates = all.filter(r => !usedIds.has(r.id));
+      if (!candidates.length) candidates = all;
+      if (candidates.length > 0) {
+        const pick = candidates[Math.floor(Math.random() * Math.min(8, candidates.length))];
+        usedIds.add(pick.id);
         return { url:pick.urls.regular, alt:pick.alt_description||query, credit:`Photo by ${pick.user.name} on Unsplash` };
       }
     } catch {}
     return null;
   };
 
-  const fetchImages = async (queries, logFn) => {
+  const fetchImages = async (queries, logFn, category = "") => {
     const images = [];
-    const count = Math.min(5, Math.max(3, queries.length));
+    const usedIds = new Set();
+    const count = Math.min(5, Math.max(4, queries.length || 5));
+    // Broader fallback queries used when an AI-generated query returns no usable photos
+    const fallbacks = [category ? `${category} Sri Lanka` : null, "Sri Lanka travel", "Sri Lanka landscape", "Sri Lanka tourism", "Sri Lanka nature"].filter(Boolean);
+    let fbIdx = 0;
     for (let i = 0; i < count; i++) {
-      if (i >= queries.length) break;
-      logFn(`  Fetching image ${i+1}/${count}: "${queries[i]}"…`);
-      const img = await fetchOneImage(queries[i], logFn);
+      const query = queries[i] || fallbacks[fbIdx++ % fallbacks.length];
+      logFn(`  Fetching image ${i+1}/${count}: "${query}"…`);
+      let img = await fetchOneImage(query, logFn, usedIds);
+      if (!img) {
+        const fb = fallbacks[fbIdx++ % fallbacks.length];
+        logFn(`  ↻ No usable results for "${query}" — trying "${fb}"…`, "warn");
+        img = await fetchOneImage(fb, logFn, usedIds);
+      }
       if (img) images.push(img);
       if (i < count - 1) await new Promise(r => setTimeout(r, 1500));
     }
@@ -690,6 +719,24 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     const now = new Date();
     const pubDate = scheduledAt ? new Date(scheduledAt) : null;
     const isFuture = pubDate && pubDate > now;
+
+    // Check if post already exists with this slug to prevent duplicates on retry
+    if (article.slug) {
+      try {
+        const chk = await fetch("/api/wp/find-post", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeader() },
+          body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, slug: article.slug }),
+        });
+        if (chk.ok) {
+          const found = await chk.json();
+          if (found.found) {
+            logFn?.(`  ℹ Post already exists in WordPress (id: ${found.id}, ${found.status}) — skipping duplicate`, "warn");
+            return { id: found.id, status: found.status, __alreadyExists: true };
+          }
+        }
+      } catch { /* best-effort check — proceed with create if it fails */ }
+    }
 
     // Resolve category ID (auto-create if missing)
     const categories = [];
@@ -790,8 +837,8 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       const cd = await generateContent(art);
       addTL(`  ✓ Content: ~${cd.wordCount} words`, "success");
 
-      addTL("  Fetching Unsplash images (3–5)…");
-      const imgs = await fetchImages(cd.imageQueries || [], addTL);
+      addTL("  Fetching Unsplash images (4–5)…");
+      const imgs = await fetchImages(cd.imageQueries || [], addTL, topic.category);
       addTL(`  ✓ ${imgs.length} images fetched`, "success");
 
       const finalContent = insertImagesIntoContent(cd.content, imgs);
@@ -810,12 +857,14 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     const monthData = months[monthKey];
     const lang = monthData.language || "en";
     const site = monthData.siteId ? getSite(monthData.siteId) : null;
+    const brand = getBrand(monthData);
     abortRef.current = false;
     setIsRunning(true);
     setLogs([]);
     setSelectedArticle(null);
     const articles = monthData.articles;
     addLog(`🚀 Starting — ${articles.length} articles`, "success");
+    addLog(`🏷 Brand: ${brand.name} (${brand.website})`, "info");
     if (site) addLog(`🔗 Publishing to: ${site.name}`, "info");
     else addLog("⚠ No site linked — will generate only (not publish).", "warn");
 
@@ -829,7 +878,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       try {
         updateArticle(monthKey, a.id, { status:"title_gen", error:null });
         addLog("  Generating SEO title…");
-        const td = await generateSEOTitle(a, lang);
+        const td = await generateSEOTitle(a, lang, brand);
         updateArticle(monthKey, a.id, { seoTitle:td.seoTitle, slug:td.slug, metaDesc:td.metaDescription });
         addLog(`  ✓ "${td.seoTitle}"`, "success");
       } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); continue; }
@@ -841,11 +890,11 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         updateArticle(monthKey, a.id, { status:"content_gen" });
         addLog("  Writing 2000+ word article…");
         const freshA = (monthsRef.current[monthKey] || months[monthKey])?.articles.find(x => x.id===a.id) || a;
-        const cd = await generateContent(freshA, lang);
+        const cd = await generateContent(freshA, lang, brand);
         addLog(`  ✓ ~${cd.wordCount||2000} words written`, "success");
 
         updateArticle(monthKey, a.id, { status:"images" });
-        const imgs = await fetchImages(cd.imageQueries||[], msg => addLog(msg));
+        const imgs = await fetchImages(cd.imageQueries||[], msg => addLog(msg), a.category);
         const contentWithImgs = insertImagesIntoContent(cd.content, imgs);
         updateArticle(monthKey, a.id, { content:contentWithImgs, wordCount:cd.wordCount||2000, images:imgs, status:"ready" });
         addLog(`  ✓ ${imgs.length} images embedded`, "success");
@@ -928,6 +977,23 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     if (!site?.user || !site?.appPass) { addLog("⚠ No WordPress site linked.", "error"); return; }
     const readyArts = monthData.articles.filter(a => a.status === "ready");
     if (!readyArts.length) { addLog("No ready articles to publish.", "warn"); return; }
+
+    // Auto-reschedule: if any scheduled date is in the past, rebuild the schedule
+    // starting from tomorrow so all articles get proper future dates in WordPress
+    const now = new Date();
+    const allPast = readyArts.every(a => !a.scheduledAt || new Date(a.scheduledAt) <= now);
+    if (allPast) {
+      addLog("⚠ All scheduled dates are in the past — rescheduling from tomorrow…", "warn");
+      const [h, m] = (monthData.scheduleTime || "09:00").split(":").map(Number);
+      readyArts.forEach((a, i) => {
+        const d = new Date();
+        d.setDate(d.getDate() + 1 + i * 2);
+        d.setHours(h, m, 0, 0);
+        updateArticle(monthKey, a.id, { scheduledAt: d.toISOString().slice(0, 19) });
+        a.scheduledAt = d.toISOString().slice(0, 19);
+      });
+    }
+
     setIsRunning(true);
     addLog(`\n── Publishing ${readyArts.length} ready article(s) to WordPress…`, "success");
     for (const a of readyArts) {
@@ -936,10 +1002,11 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         updateArticle(monthKey, a.id, { status:"publishing" });
         const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
         const isFuture = dt && dt > new Date();
-        addLog(`  ${isFuture ? `📅 Scheduling ${dt.toLocaleDateString()}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
-        await publishToWP(site, a, addLog);
-        updateArticle(monthKey, a.id, { status:"published" });
-        addLog(`  ✓ Done!`, "success");
+        addLog(`  ${isFuture ? `📅 Scheduling for ${dt.toLocaleDateString()}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
+        const result = await publishToWP(site, a, addLog);
+        const finalStatus = result?.__alreadyExists ? "published" : isFuture ? "published" : "published_now";
+        updateArticle(monthKey, a.id, { status: finalStatus });
+        addLog(`  ✓ ${result?.__alreadyExists ? "Already in WordPress (skipped)" : isFuture ? "Scheduled!" : "Published!"}`, "success");
         await new Promise(r => setTimeout(r, 500));
       } catch (err) {
         updateArticle(monthKey, a.id, { status:"ready", error:err.message });

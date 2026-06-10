@@ -204,6 +204,27 @@ app.post("/api/wp/upload-image", async (req, res) => {
   }
 });
 
+// Check if a post with the given slug already exists (prevents duplicates on retry)
+app.post("/api/wp/find-post", async (req, res) => {
+  const { url, user, appPass, slug } = req.body;
+  if (!url || !user || !appPass || !slug) return res.json({ found: false });
+  try {
+    const base = url.replace(/\/$/, "");
+    const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
+    const r = await fetch(
+      `${base}/wp-json/wp/v2/posts?slug=${encodeURIComponent(slug)}&status=any&per_page=1`,
+      { headers: { Authorization: auth }, signal: AbortSignal.timeout(10000) }
+    );
+    const data = await r.json();
+    if (Array.isArray(data) && data.length > 0) {
+      return res.json({ found: true, id: data[0].id, status: data[0].status });
+    }
+    res.json({ found: false });
+  } catch {
+    res.json({ found: false });
+  }
+});
+
 app.post("/api/wp/category", async (req, res) => {
   const { url, user, appPass, name } = req.body;
   try {
