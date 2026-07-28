@@ -1,11 +1,13 @@
 const express = require("express");
 const cors    = require("cors");
 const path    = require("path");
+const crypto  = require("crypto");
 const { Pool } = require("pg");
 
 const PORT   = parseInt(process.env.PORT || "3000", 10);
 
 const app = express();
+app.set("trust proxy", 1); // behind Coolify/Traefik — needed for correct req.ip
 
 // ── PostgreSQL ───────────────────────────────────────────────────
 const pool = new Pool({
@@ -45,6 +47,11 @@ const initDB = async () => {
   console.log("[DB] PostgreSQL tables ready");
 };
 
+const readState = async () => {
+  const { rows } = await pool.query("SELECT value FROM app_state WHERE key = 'main'");
+  return rows[0]?.value || {};
+};
+
 const syncArticles = async (months) => {
   if (!months) return;
   for (const [monthKey, monthData] of Object.entries(months)) {
@@ -70,17 +77,75 @@ const syncArticles = async (months) => {
   }
 };
 
+// ── Secret masking ───────────────────────────────────────────────
+const { isMasked, redactState, unmaskState } = require("./secrets");
+
+// Resolve WordPress credentials for a request. The browser only ever holds a
+// masked password, so anything masked is looked up by site id server-side.
+// Raw credentials are still accepted for testing a site before it is saved.
+const resolveCreds = async (body) => {
+  let { siteId, url, user, appPass } = body || {};
+  if (siteId && (!appPass || isMasked(appPass) || !url || !user)) {
+    const site = (await readState()).sites?.find(s => s.id === siteId);
+    if (site) {
+      url  = url  || site.url;
+      user = user || site.user;
+      if (!appPass || isMasked(appPass)) appPass = site.appPass;
+    }
+  }
+  return { url, user, appPass };
+};
+
 // ── Middleware ───────────────────────────────────────────────────
-app.use(cors());
+// The React build is served from this same origin, so cross-origin access is
+// off by default. Set CORS_ORIGIN only if you front the API from elsewhere.
+if (process.env.CORS_ORIGIN) {
+  app.use(cors({ origin: process.env.CORS_ORIGIN.split(",").map(s => s.trim()) }));
+}
 app.use(express.json({ limit: "100mb" }));
 
 // ── Auth ─────────────────────────────────────────────────────────
 const AUTH_PASS = process.env.APP_PASSWORD;
 
-// Login endpoint — exempt from auth check
+// Constant-time compare so response timing does not leak the password
+const passMatches = (given) => {
+  if (typeof given !== "string") return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(AUTH_PASS);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+};
+
+// Throttle login attempts per IP: 10 tries per 15 minutes
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX = 10;
+const loginAttempts = new Map();
+
+const tooManyAttempts = (ip) => {
+  const now = Date.now();
+  const rec = loginAttempts.get(ip);
+  if (!rec || now - rec.first > LOGIN_WINDOW_MS) {
+    loginAttempts.set(ip, { count: 1, first: now });
+    return false;
+  }
+  rec.count += 1;
+  return rec.count > LOGIN_MAX;
+};
+
+// Drop expired throttle records so the map cannot grow without bound
+setInterval(() => {
+  const cutoff = Date.now() - LOGIN_WINDOW_MS;
+  for (const [ip, rec] of loginAttempts) if (rec.first < cutoff) loginAttempts.delete(ip);
+}, LOGIN_WINDOW_MS).unref();
+
+// Login endpoint — exempt from the auth check below
 app.post("/api/auth", (req, res) => {
   if (!AUTH_PASS) return res.json({ ok: true });
-  if (req.body?.password === AUTH_PASS) return res.json({ ok: true });
+  if (tooManyAttempts(req.ip)) return res.status(429).json({ error: "Too many attempts — try again later" });
+  if (passMatches(req.body?.password)) {
+    loginAttempts.delete(req.ip);
+    return res.json({ ok: true });
+  }
   res.status(401).json({ error: "Wrong password" });
 });
 
@@ -88,15 +153,14 @@ app.post("/api/auth", (req, res) => {
 app.use("/api", (req, res, next) => {
   if (!AUTH_PASS) return next();
   if (req.path === "/health") return next();
-  if (req.headers["x-app-key"] === AUTH_PASS) return next();
+  if (passMatches(req.headers["x-app-key"])) return next();
   res.status(401).json({ error: "Unauthorized" });
 });
 
 // ── API Routes ───────────────────────────────────────────────────
 app.get("/api/state", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT value FROM app_state WHERE key = 'main'");
-    res.json(rows[0]?.value || {});
+    res.json(redactState(await readState()));
   } catch (e) {
     console.error("[DB] read error:", e.message);
     res.status(500).json({ error: e.message });
@@ -105,11 +169,12 @@ app.get("/api/state", async (req, res) => {
 
 app.post("/api/state", async (req, res) => {
   try {
+    const merged = unmaskState(req.body || {}, await readState());
     await pool.query(`
       INSERT INTO app_state (key, value, updated_at) VALUES ('main', $1, NOW())
       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
-    `, [req.body]);
-    syncArticles(req.body.months).catch(e => console.error("[DB] sync error:", e.message));
+    `, [merged]);
+    syncArticles(merged.months).catch(e => console.error("[DB] sync error:", e.message));
     res.json({ ok: true });
   } catch (e) {
     console.error("[DB] write error:", e.message);
@@ -126,9 +191,121 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+// ── Grok proxy (keeps the xAI key off the client) ────────────────
+app.post("/api/ai/generate", async (req, res) => {
+  const { prompt } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: "prompt required" });
+
+  let key, model;
+  try {
+    const cfg = (await readState()).config || {};
+    key   = process.env.GROK_API_KEY || cfg.grokKey;
+    model = cfg.grokModel || "grok-3-mini";
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+  if (!key) return res.status(400).json({ error: "Grok API key not set — add it in Settings" });
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
+        signal: AbortSignal.timeout(180000),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        const msg = data.error?.message || data.message || `HTTP ${r.status}`;
+        if (r.status === 429 && attempt < 2) {
+          await new Promise(s => setTimeout(s, 15000));
+          continue;
+        }
+        return res.status(r.status).json({ error: msg });
+      }
+      return res.json({ text: data.choices?.[0]?.message?.content || "" });
+    } catch (e) {
+      if (attempt === 2) {
+        const msg = e.name === "TimeoutError" ? "Grok did not respond within 3 minutes" : e.message;
+        return res.status(e.name === "TimeoutError" ? 504 : 500).json({ error: msg });
+      }
+    }
+  }
+});
+
+// ── Unsplash proxy (keeps access keys off the client) ────────────
+// Tracks per-key rate limits in memory and rotates to the next available key.
+const unsplashLimits = {}; // keyIndex → epoch ms when the key frees up
+
+app.post("/api/images/search", async (req, res) => {
+  const { query } = req.body || {};
+  if (!query) return res.status(400).json({ error: "query required" });
+
+  let keys;
+  try {
+    keys = ((await readState()).config?.unsplashKeys || []).filter(Boolean);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+  if (!keys.length) return res.json({ results: [], warning: "No Unsplash keys configured" });
+
+  let warning = null;
+
+  for (let tried = 0; tried < keys.length + 1; tried++) {
+    const now = Date.now();
+    let idx = keys.findIndex((_, i) => !unsplashLimits[i] || now >= unsplashLimits[i]);
+
+    if (idx === -1) {
+      // Every key is rate limited — wait for the earliest reset, then reset all
+      const earliest = Math.min(...keys.map((_, i) => unsplashLimits[i] || 0));
+      const waitMs = Math.max(0, earliest - now + 1500);
+      warning = `All ${keys.length} Unsplash key(s) rate limited — waited until ${new Date(earliest).toLocaleTimeString()}`;
+      await new Promise(s => setTimeout(s, Math.min(waitMs, 60000)));
+      for (const k of Object.keys(unsplashLimits)) delete unsplashLimits[k];
+      idx = 0;
+    }
+
+    try {
+      const r = await fetch(
+        `https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=15&orientation=landscape`,
+        { headers: { Authorization: `Client-ID ${keys[idx]}` }, signal: AbortSignal.timeout(20000) }
+      );
+      const remaining = parseInt(r.headers.get("X-Ratelimit-Remaining") ?? "99");
+
+      if (r.status === 429 || remaining === 0) {
+        const resetAt = new Date();
+        resetAt.setHours(resetAt.getHours() + 1, 0, 10, 0);
+        unsplashLimits[idx] = resetAt.getTime();
+        warning = `Unsplash key ${idx + 1}/${keys.length} rate limited — switching key`;
+        continue;
+      }
+
+      if (!r.ok) return res.status(r.status).json({ error: `Unsplash HTTP ${r.status}` });
+
+      const data = await r.json();
+      if (remaining <= 8) warning = `Unsplash key ${idx + 1}: ${remaining} requests left this hour`;
+
+      return res.json({
+        warning,
+        results: (data.results || []).map(p => ({
+          id: p.id,
+          url: p.urls.regular,
+          width: p.width,
+          alt: p.alt_description || query,
+          credit: `Photo by ${p.user?.name || "Unsplash"} on Unsplash`,
+        })),
+      });
+    } catch (e) {
+      if (tried >= keys.length - 1) return res.status(500).json({ error: e.message });
+    }
+  }
+
+  res.json({ results: [], warning: warning || "No Unsplash key available" });
+});
+
 // ── WordPress Proxy (avoids browser CORS) ───────────────────────
 app.post("/api/wp/test", async (req, res) => {
-  const { url, user, appPass } = req.body;
+  const { url, user, appPass } = await resolveCreds(req.body);
   if (!url || !user || !appPass) return res.status(400).json({ error: "url, user, appPass required" });
   try {
     const base = url.replace(/\/$/, "").replace(/\/wp-admin.*$/, "");
@@ -143,7 +320,8 @@ app.post("/api/wp/test", async (req, res) => {
 });
 
 app.post("/api/wp/post", async (req, res) => {
-  const { url, user, appPass, post } = req.body;
+  const { url, user, appPass } = await resolveCreds(req.body);
+  const { post } = req.body;
   if (!url || !user || !appPass) return res.status(400).json({ error: "url, user, appPass required" });
   try {
     const base = url.replace(/\/$/, "");
@@ -164,7 +342,8 @@ app.post("/api/wp/post", async (req, res) => {
 });
 
 app.post("/api/wp/upload-image", async (req, res) => {
-  const { url, user, appPass, imageUrl, filename, alt } = req.body;
+  const { url, user, appPass } = await resolveCreds(req.body);
+  const { imageUrl, filename, alt } = req.body;
   if (!url || !user || !appPass || !imageUrl) return res.status(400).json({ error: "url, user, appPass, imageUrl required" });
   try {
     const base = url.replace(/\/$/, "");
@@ -206,7 +385,8 @@ app.post("/api/wp/upload-image", async (req, res) => {
 
 // Check if a post with the given slug already exists (prevents duplicates on retry)
 app.post("/api/wp/find-post", async (req, res) => {
-  const { url, user, appPass, slug } = req.body;
+  const { url, user, appPass } = await resolveCreds(req.body);
+  const { slug } = req.body;
   if (!url || !user || !appPass || !slug) return res.json({ found: false });
   try {
     const base = url.replace(/\/$/, "");
@@ -226,7 +406,8 @@ app.post("/api/wp/find-post", async (req, res) => {
 });
 
 app.post("/api/wp/category", async (req, res) => {
-  const { url, user, appPass, name } = req.body;
+  const { url, user, appPass } = await resolveCreds(req.body);
+  const { name } = req.body;
   try {
     const base = url.replace(/\/$/, "");
     const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");

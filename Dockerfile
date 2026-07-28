@@ -15,7 +15,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-COPY server.js ./
+COPY server.js secrets.js ./
 COPY --from=builder /app/dist ./dist
 
 ENV PORT=3000
