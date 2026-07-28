@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getMonthKey, getMonthLabel, filterMonths, rollupMonths } from "./monthFilters";
+import { collectForbiddenBrands, enforceBrand, normalizeDomain } from "./brandGuard";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
 let _appKey = (() => { try { return sessionStorage.getItem("blog_app_key") || ""; } catch { return ""; } })();
@@ -301,6 +302,8 @@ export default function BlogAutomationPro() {
     pricePerMonth: 6000,
     currency: "Rs",
     niche: "Sri Lanka tours and travel",
+    brandName: "",
+    brandWebsite: "",
   });
   const [newUnsplashKey, setNewUnsplashKey] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -364,6 +367,9 @@ export default function BlogAutomationPro() {
   const [nmStartDate, setNmStartDate] = useState(tomorrow());
   const [nmTime, setNmTime] = useState("09:00");
   const [nmLanguage, setNmLanguage] = useState("en");
+  const [nmTopicSource, setNmTopicSource] = useState("ai"); // ai | bank
+  const [nmGenerating, setNmGenerating] = useState(false);
+  const [nmError, setNmError] = useState("");
 
   // Corrected doc upload state
   const [uploadingDocs, setUploadingDocs] = useState(false);
@@ -601,10 +607,28 @@ export default function BlogAutomationPro() {
     return c?.topics?.length ? c.topics : TOPIC_BANK;
   };
 
-  const createMonth = () => {
-    if (months[nmDate]) return;
-    const picked = [...topicBankFor(nmClientId)].sort(() => Math.random() - 0.5).slice(0, 10);
-    if (!picked.length) return;
+  const createMonth = async () => {
+    if (months[nmDate] || nmGenerating) return;
+    setNmError("");
+
+    let picked;
+    if (nmTopicSource === "ai") {
+      if (!config.grokKey) { setNmError("Grok API key not set — add it in Settings, or switch to the topic bank."); return; }
+      setNmGenerating(true);
+      try {
+        const profile = profileForClient(getClient(nmClientId), getSite(nmSiteId));
+        picked = await generateMonthlyTopics(profile, 10, getMonthLabel(nmDate), usedTitlesFor(nmClientId));
+      } catch (err) {
+        setNmError(err.message);
+        setNmGenerating(false);
+        return;
+      }
+      setNmGenerating(false);
+    } else {
+      picked = [...topicBankFor(nmClientId)].sort(() => Math.random() - 0.5).slice(0, 10);
+    }
+
+    if (!picked?.length) { setNmError("No topics available for this month."); return; }
     const schedule = buildSchedule(nmStartDate, nmTime, picked.length);
     const articles = picked.map((t, i) => ({
       id: `${nmDate}-${i}`, ...t,
@@ -686,13 +710,20 @@ export default function BlogAutomationPro() {
   // website, niche and target keywords. The linked client wins; the linked site
   // and then the global defaults fill any gaps.
   const profileForClient = (client, site) => {
-    const name = client?.name || site?.name || "Wonders of Lanka";
-    const rawWebsite = client?.website || site?.url || "wondersoflanka.com";
-    const website = rawWebsite.replace(/^https?:\/\//, "").replace(/\/$/, "");
+    // Client first, then the linked site, then the global default. Nothing is
+    // hardcoded: an article must only ever carry this client's own brand.
+    const name = client?.name || site?.name || config.brandName || "";
+    const rawWebsite = client?.website || site?.url || config.brandWebsite || "";
+    const website = normalizeDomain(rawWebsite);
     return {
+      clientId: client?.id || "",
       name, website,
-      niche: client?.niche || config.niche || "Sri Lanka tours and travel",
+      niche: client?.niche || config.niche || "",
       keywords: client?.keywords?.length ? client.keywords : targetKeywords,
+      // Every other client's brand, plus legacy defaults — never to appear here
+      forbidden: collectForbiddenBrands({
+        clients, activeClientId: client?.id || "", activeName: name, activeWebsite: website,
+      }),
     };
   };
 
@@ -761,7 +792,23 @@ export default function BlogAutomationPro() {
   };
 
   const LANG_NAMES = { en:"English", it:"Italian", de:"German", fr:"French", es:"Spanish" };
-  const DEFAULT_PROFILE = { name: "Wonders of Lanka", website: "wondersoflanka.com", niche: "Sri Lanka tours and travel", keywords: [] };
+  const DEFAULT_PROFILE = { name: "", website: "", niche: "", keywords: [], forbidden: [] };
+
+  // Brand rules injected into every generation prompt. With no brand configured
+  // we ask for entirely unbranded copy rather than letting Grok invent one.
+  const brandRules = (profile) => {
+    const forbidden = profile.forbidden?.length
+      ? `\nNEVER mention any of these names or domains — they belong to other businesses: ${profile.forbidden.map(f => `"${f}"`).join(", ")}.`
+      : "";
+    if (!profile.name && !profile.website) {
+      return `\nDo NOT mention any company, brand, agency or website name anywhere in the output.${forbidden}`;
+    }
+    const site = profile.website ? ` and the website "${profile.website}"` : "";
+    return `\nBRAND RULE: the ONLY business this article may reference is "${profile.name}"${site}. `
+      + `Every mention of a company, agency, brand, contact or website must be "${profile.name}"`
+      + (profile.website ? ` / "${profile.website}"` : "")
+      + `. Do NOT invent, cite or link any other tour operator, agency, competitor or third-party booking site.${forbidden}`;
+  };
 
   const generateSEOTitle = async (topic, lang = "en", profile = DEFAULT_PROFILE) => {
     const kws = pickRandomKeywords(profile.keywords, 2);
@@ -769,7 +816,7 @@ export default function BlogAutomationPro() {
     const langLine = lang !== "en" ? `\nWRITE EVERYTHING IN ${LANG_NAMES[lang] || lang.toUpperCase()} — title, slug (latin chars), and meta description.` : "";
     const text = await aiCall(`You are an SEO expert for "${profile.name}" (${profile.website}), a business in this niche: ${profile.niche}.
 Topic: "${topic.title}" | Keywords: ${topic.keywords}
-Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}${langLine}
+Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}${brandRules(profile)}${langLine}
 Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescription":"..."}`);
     return parseAIJson(text);
   };
@@ -783,11 +830,68 @@ Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescript
     const text = await aiCall(`You are a professional blog writer for "${profile.name}" (${profile.website}), a premium business in this niche: ${profile.niche}.
 Write a comprehensive SEO-optimized blog article.
 Title: "${topic.seoTitle || topic.title}" | Keywords: ${topic.keywords} | Category: ${topic.category}
-Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning ${profile.name}.${kwSection}${langLine}
-IMPORTANT: This article is for "${profile.name}" (${profile.website}) ONLY. Do NOT mention any other company, brand, agency or website name — use ONLY "${profile.name}" / "${profile.website}" wherever a brand, company, or website is referenced.
+Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions)${profile.name ? `, CTA mentioning ${profile.name}` : ""}.${kwSection}${brandRules(profile)}${langLine}
 Also generate 5 image search queries IN ENGLISH suitable for stock photography of: ${profile.niche}.
 Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1","q2","q3","q4","q5"],"wordCount":2200}`);
     return parseAIJson(text);
+  };
+
+  // Every title this client has ever been given, so Grok can avoid repeats
+  const usedTitlesFor = (clientId) => {
+    const seen = new Set();
+    for (const md of Object.values(months)) {
+      if ((md.clientId || "") !== (clientId || "")) continue;
+      for (const a of md.articles || []) {
+        if (a.title) seen.add(a.title);
+        if (a.seoTitle) seen.add(a.seoTitle);
+      }
+    }
+    return [...seen];
+  };
+
+  // Ask Grok for a fresh, current set of topics instead of reusing a fixed bank
+  const generateMonthlyTopics = async (profile, count, monthLabel, avoidTitles = []) => {
+    const cats = Object.keys(CAT);
+    const avoid = avoidTitles.length
+      ? `\nAlready used for this client — do NOT repeat or closely paraphrase any of them:\n${avoidTitles.slice(0, 100).map(t => `- ${t}`).join("\n")}`
+      : "";
+    const kws = pickRandomKeywords(profile.keywords, 6);
+    const kwLine = kws.length ? `\nThe business ranks for these services, so favour angles that support them: ${kws.join(", ")}.` : "";
+
+    const text = await aiCall(`You are an SEO content strategist${profile.name ? ` for "${profile.name}"` : ""}, planning a blog calendar for ${monthLabel}.
+Niche: ${profile.niche || "general travel"}.
+Propose exactly ${count} FRESH, specific, high-search-intent blog article topics that are timely and relevant for ${monthLabel} — seasonal angles, current traveller interests, recent trends, upcoming events. Avoid generic evergreen titles that any year could use.
+Every title must be distinct from the others in this list and cover a different angle or destination.${kwLine}${avoid}
+For each topic provide:
+- "title": 55-70 characters, specific and clickable
+- "keywords": 3-6 comma-separated search keywords
+- "category": EXACTLY one of these: ${cats.join(" | ")}
+Vary the categories across the ${count} topics.${brandRules(profile)}
+Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","category":"..."}]}`);
+
+    const parsed = parseAIJson(text);
+    const raw = Array.isArray(parsed) ? parsed : (parsed.topics || []);
+    const avoidLower = new Set(avoidTitles.map(t => t.toLowerCase().trim()));
+    const seen = new Set();
+    const topics = [];
+
+    for (const t of raw) {
+      const title = String(t?.title || "").trim();
+      if (!title) continue;
+      const lower = title.toLowerCase();
+      if (avoidLower.has(lower) || seen.has(lower)) continue; // drop repeats
+      seen.add(lower);
+      topics.push({
+        title,
+        keywords: String(t.keywords || "").trim(),
+        // Grok occasionally invents a category — snap it back to a known one
+        category: CAT[t.category] ? t.category : cats[topics.length % cats.length],
+      });
+      if (topics.length >= count) break;
+    }
+
+    if (!topics.length) throw new Error("Grok returned no usable topics — try again");
+    return topics;
   };
 
   // Proxied through Express — access keys stay server-side, which also handles
@@ -988,11 +1092,14 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       const cd = await generateContent(art, "en", profile);
       addTL(`  ✓ Content: ~${cd.wordCount} words`, "success");
 
+      const guarded = enforceBrand(cd.content, profile, profile.forbidden);
+      if (guarded.replaced) addTL(`  🛡 Rewrote ${guarded.replaced} stray brand mention(s): ${guarded.terms.join(", ")}`, "warn");
+
       addTL("  Fetching Unsplash images (4–5)…");
       const imgs = await fetchImages(cd.imageQueries || [], addTL, topic.category, profile.niche);
       addTL(`  ✓ ${imgs.length} images fetched`, "success");
 
-      const finalContent = insertImagesIntoContent(cd.content, imgs);
+      const finalContent = insertImagesIntoContent(guarded.html, imgs);
       setTestResult({ seoTitle: td.seoTitle, slug: td.slug, metaDesc: td.metaDescription, content: finalContent, images: imgs, wordCount: cd.wordCount, category: topic.category, keywords: topic.keywords });
       addTL("Done! Article ready to preview.", "success");
     } catch (err) {
@@ -1031,8 +1138,11 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         updateArticle(monthKey, a.id, { status:"title_gen", error:null });
         addLog("  Generating SEO title…");
         const td = await generateSEOTitle(a, lang, profile);
-        updateArticle(monthKey, a.id, { seoTitle:td.seoTitle, slug:td.slug, metaDesc:td.metaDescription });
-        addLog(`  ✓ "${td.seoTitle}"`, "success");
+        const gTitle = enforceBrand(td.seoTitle, profile, profile.forbidden);
+        const gMeta  = enforceBrand(td.metaDescription, profile, profile.forbidden);
+        if (gTitle.replaced + gMeta.replaced) addLog(`  🛡 Rewrote ${gTitle.replaced + gMeta.replaced} stray brand mention(s) in title/meta`, "warn");
+        updateArticle(monthKey, a.id, { seoTitle:gTitle.html, slug:td.slug, metaDesc:gMeta.html });
+        addLog(`  ✓ "${gTitle.html}"`, "success");
       } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); continue; }
 
       if (abortRef.current) break;
@@ -1045,9 +1155,13 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         const cd = await generateContent(freshA, lang, profile);
         addLog(`  ✓ ~${cd.wordCount||2000} words written`, "success");
 
+        // Last line of defence: rewrite any competitor brand Grok let through
+        const guarded = enforceBrand(cd.content, profile, profile.forbidden);
+        if (guarded.replaced) addLog(`  🛡 Rewrote ${guarded.replaced} stray brand mention(s): ${guarded.terms.join(", ")}`, "warn");
+
         updateArticle(monthKey, a.id, { status:"images" });
         const imgs = await fetchImages(cd.imageQueries||[], (msg, type) => addLog(msg, type), a.category, profile.niche);
-        const contentWithImgs = insertImagesIntoContent(cd.content, imgs);
+        const contentWithImgs = insertImagesIntoContent(guarded.html, imgs);
         updateArticle(monthKey, a.id, { content:contentWithImgs, wordCount:cd.wordCount||2000, images:imgs, status:"ready" });
         addLog(`  ✓ ${imgs.length} images embedded`, "success");
       } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); continue; }
@@ -1324,7 +1438,7 @@ ${embeddedContent}
   const testBank = topicBankFor(testClientId);
   const testTopic = testBank[Math.min(testTopicIdx, testBank.length - 1)];
   const nmBank = topicBankFor(nmClientId);
-  const nmCount = Math.min(10, nmBank.length);
+  const nmCount = nmTopicSource === "ai" ? 10 : Math.min(10, nmBank.length);
   const nmUsesClientTopics = !!clients.find(c => c.id === nmClientId)?.topics?.length;
   const sortedMonths = Object.keys(months).sort().reverse();
   const totalRevenue = payments.filter(p => p.status==="paid").reduce((s,p) => s+(p.amount||0), 0);
@@ -2193,6 +2307,9 @@ ${embeddedContent}
                 <Field label={`Price per Month (${cur})`} value={config.pricePerMonth} onChange={v => setConfig(p=>({...p,pricePerMonth:parseFloat(v)||0}))} type="number" hint="Used for clients with no price of their own" />
                 <Field label="Default Niche" value={config.niche||""} onChange={v => setConfig(p=>({...p,niche:v}))} placeholder="Sri Lanka tours and travel"
                   hint="Fallback for clients with no niche set — shapes AI prompts and image searches." />
+                <Field label="Default Brand Name" value={config.brandName||""} onChange={v => setConfig(p=>({...p,brandName:v}))} placeholder="(none)"
+                  hint="Only used for months with no client and no site. Leave blank and articles are written with no brand at all." />
+                <Field label="Default Brand Website" value={config.brandWebsite||""} onChange={v => setConfig(p=>({...p,brandWebsite:v}))} placeholder="(none)" mono />
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24, gridColumn:"1 / -1" }}>
                 <h3 style={{ margin:"0 0 6px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🎯 Fallback Target Keywords</h3>
@@ -2679,10 +2796,23 @@ ${embeddedContent}
             <Select label="Client" value={nmClientId} onChange={v => { setNmClientId(v); setNmSiteId(""); }}
               options={[{ value:"", label:"— No client —" }, ...clients.map(c => ({ value:c.id, label:c.name }))]} />
 
-            <div style={{ background: nmUsesClientTopics ? "rgba(20,184,166,0.06)" : "rgba(251,191,36,0.06)", border:`1px solid ${nmUsesClientTopics ? "rgba(20,184,166,0.2)" : "rgba(251,191,36,0.25)"}`, borderRadius:10, padding:"10px 14px", marginBottom:16, fontSize:11, lineHeight:1.6, color: nmUsesClientTopics ? C.teal : "#fde68a" }}>
-              {nmUsesClientTopics
-                ? `Drawing from this client's own topic bank (${nmBank.length} topics).`
-                : `No client topic bank — using the ${nmBank.length} built-in topics. Add topics in the client's Content Profile to make months client-specific.`}
+            {/* Topic source */}
+            <div style={{ marginBottom:16 }}>
+              <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:500, letterSpacing:"0.05em", textTransform:"uppercase" }}>Topics</label>
+              <div style={{ display:"flex", gap:6 }}>
+                {[["ai","✦ Fresh AI topics"],["bank","📚 Topic bank"]].map(([v,l]) => (
+                  <button key={v} onClick={() => { setNmTopicSource(v); setNmError(""); }}
+                    style={{ flex:1, padding:"8px 0", borderRadius:9, border:`1px solid ${nmTopicSource===v ? C.teal : C.border2}`, background: nmTopicSource===v ? "rgba(20,184,166,0.1)" : "transparent", color: nmTopicSource===v ? C.teal : C.muted, fontSize:12, fontWeight:600, cursor:"pointer" }}
+                  >{l}</button>
+                ))}
+              </div>
+              <div style={{ background: nmTopicSource==="ai" ? "rgba(20,184,166,0.06)" : nmUsesClientTopics ? "rgba(20,184,166,0.06)" : "rgba(251,191,36,0.06)", border:`1px solid ${nmTopicSource==="ai" || nmUsesClientTopics ? "rgba(20,184,166,0.2)" : "rgba(251,191,36,0.25)"}`, borderRadius:10, padding:"10px 14px", marginTop:8, fontSize:11, lineHeight:1.6, color: nmTopicSource==="ai" || nmUsesClientTopics ? C.teal : "#fde68a" }}>
+                {nmTopicSource === "ai"
+                  ? `Grok will generate 10 fresh topics for ${getMonthLabel(nmDate)}, skipping the ${usedTitlesFor(nmClientId).length} title(s) this client already has — so no two months repeat.`
+                  : nmUsesClientTopics
+                    ? `Drawing from this client's own topic bank (${nmBank.length} topics).`
+                    : `No client topic bank — using the ${nmBank.length} built-in topics. These repeat across months; switch to Fresh AI topics to avoid that.`}
+              </div>
             </div>
 
             <Select label="WordPress Site" value={nmSiteId} onChange={setNmSiteId}
@@ -2709,9 +2839,17 @@ ${embeddedContent}
               <div style={{ fontSize:11, color:C.muted2, marginTop:8 }}>Articles publish at {nmTime} · WordPress handles scheduling via <code style={{ color:C.teal }}>status: "future"</code></div>
             </div>
 
+            {nmError && (
+              <div style={{ background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.25)", borderRadius:10, padding:"10px 14px", marginBottom:14, fontSize:12, color:"#fca5a5", lineHeight:1.6 }}>
+                ✕ {nmError}
+              </div>
+            )}
+
             <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
-              <Btn onClick={() => setShowNewMonth(false)} variant="ghost">Cancel</Btn>
-              <Btn onClick={createMonth} disabled={!!months[nmDate]}>{months[nmDate] ? "Month exists" : "Create Month"}</Btn>
+              <Btn onClick={() => setShowNewMonth(false)} variant="ghost" disabled={nmGenerating}>Cancel</Btn>
+              <Btn onClick={createMonth} disabled={!!months[nmDate] || nmGenerating}>
+                {months[nmDate] ? "Month exists" : nmGenerating ? "⏳ Generating topics…" : "Create Month"}
+              </Btn>
             </div>
           </div>
         </div>
