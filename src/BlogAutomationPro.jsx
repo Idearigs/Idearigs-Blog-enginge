@@ -17,9 +17,44 @@ const loadState = async () => {
   return null;
 };
 
-const saveState = (s) => {
-  fetch("/api/state", { method:"POST", headers:{"Content-Type":"application/json", ...authHeader()}, body:JSON.stringify(s) }).catch(() => {});
+// Debounced — state changes on every keystroke, and each save rewrites the
+// whole JSONB blob plus re-syncs the articles table. Any pending write is
+// flushed when the page is hidden so the debounce cannot lose an edit.
+let _saveTimer = null;
+let _pendingState = null;
+
+const flushState = (keepalive = false) => {
+  if (!_pendingState) return;
+  const body = JSON.stringify(_pendingState);
+  _pendingState = null;
+  clearTimeout(_saveTimer);
+  fetch("/api/state", {
+    method: "POST",
+    headers: { "Content-Type":"application/json", ...authHeader() },
+    body,
+    keepalive,
+  }).catch(() => {});
 };
+
+const saveState = (s) => {
+  _pendingState = s;
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => flushState(false), 800);
+};
+
+if (typeof window !== "undefined") {
+  // visibilitychange fires while the page can still make a normal request;
+  // pagehide is the last resort and needs keepalive to survive unload.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushState(false);
+  });
+  window.addEventListener("pagehide", () => flushState(true));
+}
+
+// Secrets arrive from the server as "••••••••abcd" placeholders and are sent
+// back unchanged unless the user types a new value.
+const MASK = "••••••••";
+const isMasked = (v) => typeof v === "string" && v.startsWith(MASK);
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 // ─── HELPERS ─────────────────────────────────────────────────────
@@ -62,6 +97,10 @@ const CAT = {
   "Wellness":          { grad: "linear-gradient(135deg,#022c22,#065f46)", text: "#5eead4", dot: "#14b8a6" },
 };
 
+// Statuses that count as delivered work, and those that are live in WordPress
+const DONE_STATUSES = ["published", "published_now", "ready"];
+const LIVE_STATUSES = ["published", "published_now"];
+
 const STEPS = [
   { id: "title_gen",   icon: "✦", label: "SEO Title",  desc: "Generating optimized title & slug" },
   { id: "content_gen", icon: "✎", label: "Content",    desc: "Writing 2000+ word article" },
@@ -78,9 +117,9 @@ const C = {
 
 // ─── SCHEDULE: 1 article per day, skip a day between each ────────
 // Article 1 → startDate, Article 2 → startDate+2, Article 3 → startDate+4 …
-const buildSchedule = (startDate, time) => {
+const buildSchedule = (startDate, time, count = 10) => {
   const [h, m] = (time || "09:00").split(":").map(Number);
-  return Array.from({ length: 10 }, (_, i) => {
+  return Array.from({ length: count }, (_, i) => {
     const d = new Date(startDate + "T00:00:00");
     d.setDate(d.getDate() + i * 2); // every other day
     d.setHours(h, m, 0, 0);
@@ -183,7 +222,7 @@ const Select = ({ label, value, onChange, options }) => (
 // ─── PIPELINE VISUALIZER ─────────────────────────────────────────
 const PipelineVisualizer = ({ articles, logs, isRunning, logEndRef }) => {
   const total = articles.length;
-  const done = articles.filter(a => ["published","ready"].includes(a.status)).length;
+  const done = articles.filter(a => DONE_STATUSES.includes(a.status)).length;
   const errored = articles.filter(a => a.status === "error").length;
   const progress = Math.round((done / total) * 100);
   const activeArticle = articles.find(a => ["title_gen","content_gen","images","publishing"].includes(a.status));
@@ -255,12 +294,15 @@ export default function BlogAutomationPro() {
   const [sites, setSites] = useState([]);
   const [selectedMonth, setSelectedMonth] = useState(null);
   const [selectedArticle, setSelectedArticle] = useState(null);
+  // API keys live server-side; what is held here is either a masked placeholder
+  // (already saved) or a new value the user just typed.
   const [config, setConfig] = useState({
-    grokKey: import.meta.env.VITE_GROK_API_KEY || "",
+    grokKey: "",
     grokModel: "grok-3-mini",
-    unsplashKeys: [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean),
+    unsplashKeys: [],
     pricePerMonth: 6000,
     currency: "Rs",
+    niche: "Sri Lanka tours and travel",
   });
   const [newUnsplashKey, setNewUnsplashKey] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -280,6 +322,7 @@ export default function BlogAutomationPro() {
 
   // Test article
   const [showTestModal, setShowTestModal] = useState(false);
+  const [testClientId, setTestClientId] = useState("");
   const [testTopicIdx, setTestTopicIdx] = useState(0);
   const [testCustomTitle, setTestCustomTitle] = useState("");
   const [testCustomKeywords, setTestCustomKeywords] = useState("");
@@ -298,9 +341,17 @@ export default function BlogAutomationPro() {
   const [editingSiteId, setEditingSiteId] = useState(null);
   const [editingClientId, setEditingClientId] = useState(null);
   const [siteForm, setSiteForm] = useState({ name:"", url:"", user:"", appPass:"", clientId:"" });
-  const [clientForm, setClientForm] = useState({ name:"", email:"", phone:"", website:"", notes:"" });
+  const [clientForm, setClientForm] = useState({ name:"", email:"", phone:"", website:"", notes:"", niche:"", pricePerMonth:"" });
   const [siteConnStatus, setSiteConnStatus] = useState("idle"); // idle | testing | connected | error
   const [siteConnMsg, setSiteConnMsg] = useState("");
+
+  // Content profile (keywords + topic bank) per client
+  const [profileClientId, setProfileClientId] = useState(null);
+  const [profileTab, setProfileTab] = useState("keywords"); // keywords | topics
+  const [kwSearch, setKwSearch] = useState("");
+  const [kwBulk, setKwBulk] = useState("");
+  const [topicBulk, setTopicBulk] = useState("");
+  const [topicForm, setTopicForm] = useState({ title:"", keywords:"", category:"Destinations" });
 
   // New month config
   const [nmDate, setNmDate] = useState(getMonthKey());
@@ -320,20 +371,26 @@ export default function BlogAutomationPro() {
   const applyState = (saved) => {
     if (!saved) return;
     if (saved.months)        setMonths(saved.months);
-    if (saved.clients)       setClients(saved.clients);
+    // Older records predate per-client content profiles — normalise them here
+    if (saved.clients)       setClients(saved.clients.map(c => ({
+      ...c,
+      niche:    c.niche || "",
+      keywords: Array.isArray(c.keywords) ? c.keywords : [],
+      topics:   Array.isArray(c.topics)   ? c.topics   : [],
+    })));
     if (saved.sites)         setSites(saved.sites);
     if (saved.config)        setConfig(p => {
       const sc = saved.config;
       let keys = sc.unsplashKeys || [];
       if (!keys.length && sc.unsplashAccessKey) keys = [sc.unsplashAccessKey];
-      if (!keys.length) keys = [import.meta.env.VITE_UNSPLASH_ACCESS_KEY || ""].filter(Boolean);
       return {
         ...p, ...sc,
-        grokKey: sc.grokKey || sc.geminiKey || import.meta.env.VITE_GROK_API_KEY || "",
-        grokModel: "grok-3-mini",
+        grokKey: sc.grokKey || sc.geminiKey || "",
+        grokModel: sc.grokModel || "grok-3-mini",
         unsplashKeys: keys,
         pricePerMonth: sc.pricePerMonth ?? 6000,
         currency: sc.currency || "Rs",
+        niche: sc.niche || "Sri Lanka tours and travel",
       };
     });
     if (saved.payments)      setPayments(saved.payments);
@@ -367,6 +424,8 @@ export default function BlogAutomationPro() {
 
   useEffect(() => { if (loaded) saveState({ months, clients, sites, config, payments, targetKeywords }); }, [months, clients, sites, config, payments, targetKeywords, loaded]);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior:"smooth" }); }, [logs]);
+  // Keep the ref in step with state so long-running loops read fresh articles
+  useEffect(() => { monthsRef.current = months; }, [months]);
 
   const saveSettings = async () => {
     setSettingsSaving(true);
@@ -394,18 +453,96 @@ export default function BlogAutomationPro() {
   };
 
   // ─── CLIENTS ────────────────────────────────────────────────
-  const openAddClient = () => { setEditingClientId(null); setClientForm({ name:"", email:"", phone:"", website:"", notes:"" }); setShowClientModal(true); };
-  const openEditClient = (c) => { setEditingClientId(c.id); setClientForm({ name:c.name, email:c.email||"", phone:c.phone||"", website:c.website||"", notes:c.notes||"" }); setShowClientModal(true); };
+  const BLANK_CLIENT = { name:"", email:"", phone:"", website:"", notes:"", niche:"", pricePerMonth:"" };
+  const openAddClient = () => { setEditingClientId(null); setClientForm(BLANK_CLIENT); setShowClientModal(true); };
+  const openEditClient = (c) => {
+    setEditingClientId(c.id);
+    setClientForm({
+      name:c.name, email:c.email||"", phone:c.phone||"", website:c.website||"",
+      notes:c.notes||"", niche:c.niche||"", pricePerMonth:c.pricePerMonth ?? "",
+    });
+    setShowClientModal(true);
+  };
   const saveClient = () => {
     if (!clientForm.name) return;
+    const patch = { ...clientForm, pricePerMonth: clientForm.pricePerMonth === "" ? null : parseFloat(clientForm.pricePerMonth) || 0 };
     if (editingClientId) {
-      setClients(p => p.map(c => c.id===editingClientId ? { ...c, ...clientForm } : c));
+      setClients(p => p.map(c => c.id===editingClientId ? { ...c, ...patch } : c));
     } else {
-      setClients(p => [...p, { id:uid(), ...clientForm, createdAt:new Date().toISOString() }]);
+      setClients(p => [...p, { id:uid(), ...patch, keywords:[], topics:[], createdAt:new Date().toISOString() }]);
     }
     setShowClientModal(false);
   };
   const deleteClient = (id) => { if (confirm("Delete client? Their linked sites will remain.")) setClients(p => p.filter(c => c.id!==id)); };
+
+  // ─── CONTENT PROFILE (per-client keywords + topics) ─────────
+  const updateClient = (id, patch) => setClients(p => p.map(c => c.id===id ? { ...c, ...patch } : c));
+
+  const openProfile = (c) => {
+    setProfileClientId(c.id);
+    setProfileTab("keywords");
+    setKwSearch(""); setKwBulk(""); setTopicBulk("");
+    setTopicForm({ title:"", keywords:"", category:"Destinations" });
+  };
+
+  // Accepts newline- or comma-separated input; dedupes case-insensitively
+  const parseKeywordList = (text) =>
+    text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+
+  const addKeywords = (clientId, text) => {
+    const incoming = parseKeywordList(text);
+    if (!incoming.length) return;
+    const client = clients.find(c => c.id===clientId);
+    const existing = client?.keywords || [];
+    const seen = new Set(existing.map(k => k.toLowerCase()));
+    const added = [];
+    for (const kw of incoming) {
+      if (seen.has(kw.toLowerCase())) continue;
+      seen.add(kw.toLowerCase());
+      added.push(kw);
+    }
+    if (added.length) updateClient(clientId, { keywords: [...existing, ...added] });
+    setKwBulk("");
+  };
+
+  const removeKeyword = (clientId, kw) => {
+    const client = clients.find(c => c.id===clientId);
+    updateClient(clientId, { keywords: (client?.keywords || []).filter(k => k !== kw) });
+  };
+
+  const addTopic = (clientId, topic) => {
+    if (!topic.title.trim()) return;
+    const client = clients.find(c => c.id===clientId);
+    updateClient(clientId, { topics: [...(client?.topics || []), {
+      title: topic.title.trim(),
+      keywords: topic.keywords.trim(),
+      category: topic.category || "Destinations",
+    }]});
+    setTopicForm({ title:"", keywords:"", category: topic.category || "Destinations" });
+  };
+
+  // One topic per line: "Title | keyword, keyword | Category" (last two optional)
+  const addTopicsBulk = (clientId, text) => {
+    const rows = text.split("\n").map(l => l.trim()).filter(Boolean);
+    if (!rows.length) return;
+    const client = clients.find(c => c.id===clientId);
+    const existing = client?.topics || [];
+    const seen = new Set(existing.map(t => t.title.toLowerCase()));
+    const added = [];
+    for (const row of rows) {
+      const [title, keywords = "", category = ""] = row.split("|").map(s => s.trim());
+      if (!title || seen.has(title.toLowerCase())) continue;
+      seen.add(title.toLowerCase());
+      added.push({ title, keywords, category: CAT[category] ? category : "Destinations" });
+    }
+    if (added.length) updateClient(clientId, { topics: [...existing, ...added] });
+    setTopicBulk("");
+  };
+
+  const removeTopic = (clientId, idx) => {
+    const client = clients.find(c => c.id===clientId);
+    updateClient(clientId, { topics: (client?.topics || []).filter((_, i) => i !== idx) });
+  };
 
   // ─── SITES ──────────────────────────────────────────────────
   const openAddSite = (clientId="") => {
@@ -441,7 +578,7 @@ export default function BlogAutomationPro() {
       const res = await fetch("/api/wp/test", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeader() },
-        body: JSON.stringify({ url: siteForm.url, user: siteForm.user, appPass: siteForm.appPass }),
+        body: JSON.stringify({ siteId: editingSiteId || "", url: siteForm.url, user: siteForm.user, appPass: siteForm.appPass }),
       });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
@@ -454,10 +591,18 @@ export default function BlogAutomationPro() {
   };
 
   // ─── MONTHS ─────────────────────────────────────────────────
+  // A client's own topic bank wins; the built-in list is the fallback
+  const topicBankFor = (clientId) => {
+    const c = clients.find(x => x.id === clientId);
+    return c?.topics?.length ? c.topics : TOPIC_BANK;
+  };
+
   const createMonth = () => {
     if (months[nmDate]) return;
-    const schedule = buildSchedule(nmStartDate, nmTime);
-    const articles = [...TOPIC_BANK].sort(() => Math.random() - 0.5).slice(0, 10).map((t, i) => ({
+    const picked = [...topicBankFor(nmClientId)].sort(() => Math.random() - 0.5).slice(0, 10);
+    if (!picked.length) return;
+    const schedule = buildSchedule(nmStartDate, nmTime, picked.length);
+    const articles = picked.map((t, i) => ({
       id: `${nmDate}-${i}`, ...t,
       seoTitle:"", content:"", metaDesc:"", slug:"",
       images:[], status:"pending", wordCount:0, error:null,
@@ -469,7 +614,7 @@ export default function BlogAutomationPro() {
       scheduleStartDate: nmStartDate, scheduleTime: nmTime,
       language: nmLanguage,
     }}));
-    const price = clients.find(c => c.id===nmClientId)?.pricePerMonth || config.pricePerMonth;
+    const price = clients.find(c => c.id===nmClientId)?.pricePerMonth ?? config.pricePerMonth;
     setPayments(p => [...p, { monthKey:nmDate, status:"unpaid", amount:price, paidAt:null, clientId:nmClientId }]);
     setShowNewMonth(false);
     setSelectedMonth(nmDate);
@@ -511,15 +656,24 @@ export default function BlogAutomationPro() {
   const getSite = (id) => sites.find(s => s.id===id);
   const getClient = (id) => clients.find(c => c.id===id);
 
-  // Resolve the brand (company name + website) that AI-generated content should reference.
-  // Prefers the linked client, falls back to the linked site, then to a default.
-  const getBrand = (monthData) => {
-    const site = monthData?.siteId ? getSite(monthData.siteId) : null;
-    const client = monthData?.clientId ? getClient(monthData.clientId) : (site?.clientId ? getClient(site.clientId) : null);
+  // Resolve the content profile AI generation should write against: brand name,
+  // website, niche and target keywords. The linked client wins; the linked site
+  // and then the global defaults fill any gaps.
+  const profileForClient = (client, site) => {
     const name = client?.name || site?.name || "Wonders of Lanka";
     const rawWebsite = client?.website || site?.url || "wondersoflanka.com";
     const website = rawWebsite.replace(/^https?:\/\//, "").replace(/\/$/, "");
-    return { name, website };
+    return {
+      name, website,
+      niche: client?.niche || config.niche || "Sri Lanka tours and travel",
+      keywords: client?.keywords?.length ? client.keywords : targetKeywords,
+    };
+  };
+
+  const getProfile = (monthData) => {
+    const site = monthData?.siteId ? getSite(monthData.siteId) : null;
+    const client = monthData?.clientId ? getClient(monthData.clientId) : (site?.clientId ? getClient(site.clientId) : null);
+    return profileForClient(client, site);
   };
 
   const updateArticle = useCallback((monthKey, articleId, updates) => {
@@ -534,28 +688,23 @@ export default function BlogAutomationPro() {
   }, []);
 
   // ─── API ────────────────────────────────────────────────────
-  const geminiCall = async (prompt, retries = 3) => {
-    const model = config.grokModel || "grok-3-mini";
-    const res = await fetch("https://api.x.ai/v1/chat/completions", {
+  // Proxied through Express — the xAI key never reaches the browser.
+  // Retries and model selection are handled server-side.
+  const aiCall = async (prompt) => {
+    const res = await fetch("/api/ai/generate", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.grokKey}` },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
+      headers: { "Content-Type": "application/json", ...authHeader() },
+      body: JSON.stringify({ prompt }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      const msg = data.error?.message || data.message || `HTTP ${res.status}`;
-      if (retries > 0 && res.status === 429) {
-        await new Promise(r => setTimeout(r, 15000));
-        return geminiCall(prompt, retries - 1);
-      }
-      throw new Error(msg);
-    }
-    return data.choices?.[0]?.message?.content || "";
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data.text || "";
   };
 
-  const pickRandomKeywords = (n = 3) => {
-    if (!targetKeywords.length) return [];
-    const shuffled = [...targetKeywords].sort(() => Math.random() - 0.5);
+  const pickRandomKeywords = (list, n = 3) => {
+    const pool = list || [];
+    if (!pool.length) return [];
+    const shuffled = [...pool].sort(() => Math.random() - 0.5);
     return shuffled.slice(0, Math.min(n, shuffled.length));
   };
 
@@ -586,77 +735,48 @@ export default function BlogAutomationPro() {
   };
 
   const LANG_NAMES = { en:"English", it:"Italian", de:"German", fr:"French", es:"Spanish" };
-  const DEFAULT_BRAND = { name: "Wonders of Lanka", website: "wondersoflanka.com" };
+  const DEFAULT_PROFILE = { name: "Wonders of Lanka", website: "wondersoflanka.com", niche: "Sri Lanka tours and travel", keywords: [] };
 
-  const generateSEOTitle = async (topic, lang = "en", brand = DEFAULT_BRAND) => {
-    const kws = pickRandomKeywords(2);
+  const generateSEOTitle = async (topic, lang = "en", profile = DEFAULT_PROFILE) => {
+    const kws = pickRandomKeywords(profile.keywords, 2);
     const kwHint = kws.length ? `\nNaturally weave 1-2 of these service keywords into the meta description if relevant: ${kws.join(", ")}` : "";
     const langLine = lang !== "en" ? `\nWRITE EVERYTHING IN ${LANG_NAMES[lang] || lang.toUpperCase()} — title, slug (latin chars), and meta description.` : "";
-    const text = await geminiCall(`You are an SEO expert for "${brand.name}" (${brand.website}), a Sri Lanka tour and travel agency.
+    const text = await aiCall(`You are an SEO expert for "${profile.name}" (${profile.website}), a business in this niche: ${profile.niche}.
 Topic: "${topic.title}" | Keywords: ${topic.keywords}
 Generate SEO title (50-65 chars), URL slug, meta description (150-160 chars).${kwHint}${langLine}
 Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescription":"..."}`);
     return parseAIJson(text);
   };
 
-  const generateContent = async (topic, lang = "en", brand = DEFAULT_BRAND) => {
-    const kws = pickRandomKeywords(3);
+  const generateContent = async (topic, lang = "en", profile = DEFAULT_PROFILE) => {
+    const kws = pickRandomKeywords(profile.keywords, 3);
     const kwSection = kws.length
       ? `\nService keywords to naturally include 1-2 times each (do NOT stuff — weave them in naturally as anchor text or in context): ${kws.map(k => `"${k}"`).join(", ")}`
       : "";
     const langLine = lang !== "en" ? `\nCRITICAL: Write the ENTIRE article in ${LANG_NAMES[lang] || lang} — all headings, paragraphs, FAQ, and CTA must be in ${LANG_NAMES[lang] || lang}.` : "";
-    const text = await geminiCall(`You are a professional travel blog writer for "${brand.name}" (${brand.website}), a premium Sri Lanka tour and travel agency.
+    const text = await aiCall(`You are a professional blog writer for "${profile.name}" (${profile.website}), a premium business in this niche: ${profile.niche}.
 Write a comprehensive SEO-optimized blog article.
 Title: "${topic.seoTitle || topic.title}" | Keywords: ${topic.keywords} | Category: ${topic.category}
-Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning ${brand.name}.${kwSection}${langLine}
-IMPORTANT: This article is for "${brand.name}" (${brand.website}) ONLY. Do NOT mention "Wonders of Lanka", "wondersoflanka.com", or any other tour/travel company name — use ONLY "${brand.name}" / "${brand.website}" wherever a brand, company, or website is referenced.
-Also generate 5 Unsplash image search queries IN ENGLISH (Sri Lanka travel photography).
+Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions), CTA mentioning ${profile.name}.${kwSection}${langLine}
+IMPORTANT: This article is for "${profile.name}" (${profile.website}) ONLY. Do NOT mention any other company, brand, agency or website name — use ONLY "${profile.name}" / "${profile.website}" wherever a brand, company, or website is referenced.
+Also generate 5 image search queries IN ENGLISH suitable for stock photography of: ${profile.niche}.
 Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1","q2","q3","q4","q5"],"wordCount":2200}`);
     return parseAIJson(text);
   };
 
-  // Per-key rate limit tracking: { keyIndex: resetTimestampMs }
-  const unsplashKeyLimits = useRef({});
-
+  // Proxied through Express — access keys stay server-side, which also handles
+  // per-key rate limit tracking and rotation.
   const fetchOneImage = async (query, logFn, usedIds) => {
-    const keys = (config.unsplashKeys || []).filter(Boolean);
-    if (!keys.length) return null;
-
-    const now = Date.now();
-    // Find first available (non-rate-limited) key
-    let chosenIdx = -1;
-    for (let i = 0; i < keys.length; i++) {
-      const resetAt = unsplashKeyLimits.current[i];
-      if (!resetAt || now >= resetAt) { chosenIdx = i; break; }
-    }
-
-    // All keys rate-limited — wait for the earliest reset
-    if (chosenIdx === -1) {
-      const earliest = Math.min(...Object.values(unsplashKeyLimits.current));
-      const waitMs = earliest - now + 1500;
-      const resetTime = new Date(earliest).toLocaleTimeString();
-      logFn && logFn(`  ⏳ All ${keys.length} Unsplash key(s) rate limited — waiting until ${resetTime}…`, "warn");
-      await new Promise(r => setTimeout(r, waitMs));
-      unsplashKeyLimits.current = {};
-      chosenIdx = 0;
-    }
-
-    const key = keys[chosenIdx];
     try {
-      const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query+" Sri Lanka")}&per_page=15&orientation=landscape`, {
-        headers: { Authorization: `Client-ID ${key}` }
+      const res = await fetch("/api/images/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader() },
+        body: JSON.stringify({ query }),
       });
-      const remaining = parseInt(res.headers.get("X-Ratelimit-Remaining") ?? "99");
+      const data = await res.json().catch(() => ({}));
+      if (data.warning) logFn && logFn(`  ⚠ ${data.warning}`, "warn");
+      if (!res.ok) { logFn && logFn(`  ⚠ Image search failed: ${data.error || res.status}`, "warn"); return null; }
 
-      if (res.status === 429 || remaining === 0) {
-        const resetAt = new Date(); resetAt.setHours(resetAt.getHours()+1, 0, 10, 0);
-        unsplashKeyLimits.current[chosenIdx] = resetAt.getTime();
-        logFn && logFn(`  ⚠ Key ${chosenIdx+1}/${keys.length} rate limited — switching key…`, "warn");
-        return fetchOneImage(query, logFn, usedIds); // retry with next available key
-      }
-
-      if (remaining <= 8) logFn && logFn(`  ⚠ Key ${chosenIdx+1}: only ${remaining} requests left this hour`, "warn");
-      const data = await res.json();
       const all = data.results || [];
       // Prefer high-resolution, not-yet-used-in-this-article photos; relax filters if nothing matches
       let candidates = all.filter(r => (r.width||0) >= 1600 && !usedIds.has(r.id));
@@ -665,18 +785,19 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       if (candidates.length > 0) {
         const pick = candidates[Math.floor(Math.random() * Math.min(8, candidates.length))];
         usedIds.add(pick.id);
-        return { url:pick.urls.regular, alt:pick.alt_description||query, credit:`Photo by ${pick.user.name} on Unsplash` };
+        return { url:pick.url, alt:pick.alt || query, credit:pick.credit };
       }
     } catch {}
     return null;
   };
 
-  const fetchImages = async (queries, logFn, category = "") => {
+  const fetchImages = async (queries, logFn, category = "", niche = "") => {
     const images = [];
     const usedIds = new Set();
     const count = Math.min(5, Math.max(4, queries.length || 5));
     // Broader fallback queries used when an AI-generated query returns no usable photos
-    const fallbacks = [category ? `${category} Sri Lanka` : null, "Sri Lanka travel", "Sri Lanka landscape", "Sri Lanka tourism", "Sri Lanka nature"].filter(Boolean);
+    const base = niche || "travel";
+    const fallbacks = [category ? `${category} ${base}` : null, base, `${base} landscape`, `${base} photography`].filter(Boolean);
     let fbIdx = 0;
     for (let i = 0; i < count; i++) {
       const query = queries[i] || fallbacks[fbIdx++ % fallbacks.length];
@@ -703,7 +824,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     const res = await fetch("/api/wp/category", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeader() },
-      body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, name: categoryName }),
+      body: JSON.stringify({ siteId: site.id, url: site.url, user: site.user, name: categoryName }),
     });
     const data = await res.json();
     if (data.id) {
@@ -726,7 +847,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         const chk = await fetch("/api/wp/find-post", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeader() },
-          body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, slug: article.slug }),
+          body: JSON.stringify({ siteId: site.id, url: site.url, user: site.user, slug: article.slug }),
         });
         if (chk.ok) {
           const found = await chk.json();
@@ -757,7 +878,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeader() },
           body: JSON.stringify({
-            url: site.url, user: site.user, appPass: site.appPass,
+            siteId: site.id, url: site.url, user: site.user,
             imageUrl: firstImage.url,
             filename: `${article.slug || "article"}-featured.jpg`,
             alt: firstImage.alt || article.seoTitle || article.title,
@@ -797,7 +918,7 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       const res = await fetch("/api/wp/post", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeader() },
-        body: JSON.stringify({ url: site.url, user: site.user, appPass: site.appPass, post }),
+        body: JSON.stringify({ siteId: site.id, url: site.url, user: site.user, post }),
         signal: ctrl.signal,
       });
       clearTimeout(tmo);
@@ -819,26 +940,30 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
   const runTestArticle = async () => {
     if (!config.grokKey) { setTestLogs([{ msg:"Grok API key not set — go to Settings first.", type:"error", ts:new Date().toLocaleTimeString() }]); return; }
     const addTL = (msg, type="info") => setTestLogs(p => [...p, { msg, type, ts: new Date().toLocaleTimeString() }]);
+    const bank = topicBankFor(testClientId);
+    const profile = profileForClient(getClient(testClientId), null);
     const topic = testUseCustom
-      ? { title: testCustomTitle || "Sri Lanka Travel Guide", keywords: testCustomKeywords || "Sri Lanka travel", category: testCustomCategory }
-      : TOPIC_BANK[testTopicIdx];
+      ? { title: testCustomTitle || `${profile.niche} guide`, keywords: testCustomKeywords || profile.niche, category: testCustomCategory }
+      : bank[Math.min(testTopicIdx, bank.length - 1)];
+    if (!topic) { setTestLogs([{ msg:"No topics available — add topics to this client's content profile.", type:"error", ts:new Date().toLocaleTimeString() }]); return; }
     setTestRunning(true);
     setTestResult(null);
     setTestLogs([]);
     setTestTab("preview");
     addTL(`Starting test: "${topic.title}"`, "success");
+    addTL(`  Profile: ${profile.name} (${profile.website}) · ${profile.keywords.length} keyword(s)`, "info");
     try {
       addTL("  Generating SEO title & slug…");
-      const td = await generateSEOTitle(topic);
+      const td = await generateSEOTitle(topic, "en", profile);
       addTL(`  ✓ Title: "${td.seoTitle}"`, "success");
 
       addTL("  Writing 2000+ word article…");
       const art = { ...topic, seoTitle: td.seoTitle, slug: td.slug, metaDesc: td.metaDescription };
-      const cd = await generateContent(art);
+      const cd = await generateContent(art, "en", profile);
       addTL(`  ✓ Content: ~${cd.wordCount} words`, "success");
 
       addTL("  Fetching Unsplash images (4–5)…");
-      const imgs = await fetchImages(cd.imageQueries || [], addTL, topic.category);
+      const imgs = await fetchImages(cd.imageQueries || [], addTL, topic.category, profile.niche);
       addTL(`  ✓ ${imgs.length} images fetched`, "success");
 
       const finalContent = insertImagesIntoContent(cd.content, imgs);
@@ -857,14 +982,15 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
     const monthData = months[monthKey];
     const lang = monthData.language || "en";
     const site = monthData.siteId ? getSite(monthData.siteId) : null;
-    const brand = getBrand(monthData);
+    const profile = getProfile(monthData);
     abortRef.current = false;
     setIsRunning(true);
     setLogs([]);
     setSelectedArticle(null);
     const articles = monthData.articles;
     addLog(`🚀 Starting — ${articles.length} articles`, "success");
-    addLog(`🏷 Brand: ${brand.name} (${brand.website})`, "info");
+    addLog(`🏷 Brand: ${profile.name} (${profile.website}) · niche: ${profile.niche}`, "info");
+    addLog(`🎯 ${profile.keywords.length} target keyword(s) in profile`, "info");
     if (site) addLog(`🔗 Publishing to: ${site.name}`, "info");
     else addLog("⚠ No site linked — will generate only (not publish).", "warn");
 
@@ -872,13 +998,13 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
       if (abortRef.current) { addLog("⛔ Aborted.", "error"); break; }
       const a = articles[i];
       if (a.status !== "pending" && a.status !== "error") continue;
-      addLog(`\n── [${i+1}/10] "${a.title}"${a.status==="error" ? " (retrying)" : ""}`);
+      addLog(`\n── [${i+1}/${articles.length}] "${a.title}"${a.status==="error" ? " (retrying)" : ""}`);
 
       // SEO Title
       try {
         updateArticle(monthKey, a.id, { status:"title_gen", error:null });
         addLog("  Generating SEO title…");
-        const td = await generateSEOTitle(a, lang, brand);
+        const td = await generateSEOTitle(a, lang, profile);
         updateArticle(monthKey, a.id, { seoTitle:td.seoTitle, slug:td.slug, metaDesc:td.metaDescription });
         addLog(`  ✓ "${td.seoTitle}"`, "success");
       } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); continue; }
@@ -890,11 +1016,11 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
         updateArticle(monthKey, a.id, { status:"content_gen" });
         addLog("  Writing 2000+ word article…");
         const freshA = (monthsRef.current[monthKey] || months[monthKey])?.articles.find(x => x.id===a.id) || a;
-        const cd = await generateContent(freshA, lang, brand);
+        const cd = await generateContent(freshA, lang, profile);
         addLog(`  ✓ ~${cd.wordCount||2000} words written`, "success");
 
         updateArticle(monthKey, a.id, { status:"images" });
-        const imgs = await fetchImages(cd.imageQueries||[], msg => addLog(msg), a.category);
+        const imgs = await fetchImages(cd.imageQueries||[], (msg, type) => addLog(msg, type), a.category, profile.niche);
         const contentWithImgs = insertImagesIntoContent(cd.content, imgs);
         updateArticle(monthKey, a.id, { content:contentWithImgs, wordCount:cd.wordCount||2000, images:imgs, status:"ready" });
         addLog(`  ✓ ${imgs.length} images embedded`, "success");
@@ -914,11 +1040,16 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
           const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
           const isFuture = dt && dt > new Date();
           addLog(`  ${isFuture ? `📅 Scheduling ${dt.toLocaleDateString()} ${dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
-          await publishToWP(site, a, addLog);
-          updateArticle(monthKey, a.id, { status:"published" });
-          addLog(`  ✓ ${isFuture ? "Scheduled!" : "Published!"}`, "success");
+          const result = await publishToWP(site, a, addLog);
+          updateArticle(monthKey, a.id, { status: result?.__alreadyExists || isFuture ? "published" : "published_now", error:null });
+          addLog(`  ✓ ${result?.__alreadyExists ? "Already in WordPress (skipped)" : isFuture ? "Scheduled!" : "Published!"}`, "success");
           await new Promise(r => setTimeout(r, 500));
-        } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); }
+        } catch (err) {
+          // Content is fine — only the WordPress push failed, so leave it "ready"
+          // and let "Publish Ready" retry without regenerating the article.
+          updateArticle(monthKey, a.id, { status:"ready", error:err.message });
+          addLog(`  ✕ ${err.message}`, "error");
+        }
       }
     } else if (!site) {
       addLog("\n⚠ No WordPress site linked — link one in Sites, then re-run.", "warn");
@@ -932,7 +1063,8 @@ Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1
 
   const autoExportArticles = (monthKey) => {
     try {
-      const monthData = months[monthKey];
+      // Read through the ref — `months` is stale inside a long pipeline run
+      const monthData = monthsRef.current[monthKey] || months[monthKey];
       if (!monthData) return;
       const exportData = {
         month: getMonthLabel(monthKey),
@@ -1153,9 +1285,15 @@ ${embeddedContent}
     </div>
   );
 
+  const cur = config.currency || "Rs";
+  const testBank = topicBankFor(testClientId);
+  const testTopic = testBank[Math.min(testTopicIdx, testBank.length - 1)];
+  const nmBank = topicBankFor(nmClientId);
+  const nmCount = Math.min(10, nmBank.length);
+  const nmUsesClientTopics = !!clients.find(c => c.id === nmClientId)?.topics?.length;
   const sortedMonths = Object.keys(months).sort().reverse();
   const totalRevenue = payments.filter(p => p.status==="paid").reduce((s,p) => s+(p.amount||0), 0);
-  const totalArticles = Object.values(months).reduce((s,m) => s+m.articles.filter(a => ["published","ready"].includes(a.status)).length, 0);
+  const totalArticles = Object.values(months).reduce((s,m) => s+m.articles.filter(a => DONE_STATUSES.includes(a.status)).length, 0);
   const viewArticle = selectedMonth && selectedArticle ? months[selectedMonth]?.articles.find(a => a.id===selectedArticle) : null;
 
   const NAV = [
@@ -1217,7 +1355,7 @@ ${embeddedContent}
 
           {sortedMonths.map(key => {
             const p = getPayment(key);
-            const done = months[key].articles.filter(a => ["published","ready"].includes(a.status)).length;
+            const done = months[key].articles.filter(a => DONE_STATUSES.includes(a.status)).length;
             const active = selectedMonth===key && nav==="month";
             const client = getClient(months[key].clientId);
             return (
@@ -1226,7 +1364,7 @@ ${embeddedContent}
                 <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                   <span style={{ fontWeight: active?600:400 }}>{getMonthLabel(key)}</span>
                   <span style={{ display:"flex", alignItems:"center", gap:5 }}>
-                    <span style={{ fontSize:10, color:C.muted2, fontFamily:"'JetBrains Mono',monospace" }}>{done}/10</span>
+                    <span style={{ fontSize:10, color:C.muted2, fontFamily:"'JetBrains Mono',monospace" }}>{done}/{months[key].articles.length}</span>
                     <span style={{ width:6, height:6, borderRadius:"50%", background: p.status==="paid"?"#22c55e":"#ef4444", boxShadow: p.status==="paid"?"0 0 4px #22c55e":"none" }} />
                   </span>
                 </div>
@@ -1298,13 +1436,14 @@ ${embeddedContent}
                 {sortedMonths.map(key => {
                   const p = getPayment(key);
                   const arts = months[key].articles;
-                  const pub = arts.filter(a => a.status==="published").length;
+                  const pub = arts.filter(a => LIVE_STATUSES.includes(a.status)).length;
                   const rdy = arts.filter(a => a.status==="ready").length;
-                  const pct = Math.round(((pub+rdy)/arts.length)*100);
+                  const pct = arts.length ? Math.round(((pub+rdy)/arts.length)*100) : 0;
                   const client = getClient(months[key].clientId);
                   const site = getSite(months[key].siteId);
                   const firstDate = arts[0]?.scheduledAt ? new Date(arts[0].scheduledAt).toLocaleDateString() : null;
-                  const lastDate = arts[9]?.scheduledAt ? new Date(arts[9].scheduledAt).toLocaleDateString() : null;
+                  const lastArt = arts[arts.length - 1];
+                  const lastDate = lastArt?.scheduledAt ? new Date(lastArt.scheduledAt).toLocaleDateString() : null;
                   return (
                     <div key={key}
                       style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:"16px 20px", display:"flex", justifyContent:"space-between", alignItems:"center", transition:"all 0.2s" }}
@@ -1321,7 +1460,7 @@ ${embeddedContent}
                           <div style={{ height:"100%", width:`${pct}%`, background:`linear-gradient(90deg,${C.tealDim},${C.teal})`, borderRadius:99, transition:"width 0.5s" }} />
                         </div>
                         <div style={{ fontSize:11, color:C.muted }}>
-                          {pub} scheduled · {rdy} ready · {10-pub-rdy} pending
+                          {pub} scheduled · {rdy} ready · {arts.length-pub-rdy} pending
                           {firstDate && lastDate && <span style={{ marginLeft:12, color:C.muted2 }}>📅 {firstDate} → {lastDate}</span>}
                         </div>
                       </div>
@@ -1379,6 +1518,7 @@ ${embeddedContent}
                           </div>
                         </div>
                         <div style={{ display:"flex", gap:6 }}>
+                          <Btn onClick={() => openProfile(client)} variant="ghost" small>🎯 Profile</Btn>
                           <Btn onClick={() => openEditClient(client)} variant="ghost" small>Edit</Btn>
                           <Btn onClick={() => deleteClient(client.id)} variant="danger" small>✕</Btn>
                         </div>
@@ -1386,8 +1526,8 @@ ${embeddedContent}
 
                       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14 }}>
                         {[
-                          { label:"Revenue", value:`$${clientRevenue}`, color:"#22c55e" },
-                          { label:"Pending",  value:`$${clientPending}`, color:"#f87171" },
+                          { label:"Revenue", value:`${cur} ${clientRevenue.toLocaleString()}`, color:"#22c55e" },
+                          { label:"Pending",  value:`${cur} ${clientPending.toLocaleString()}`, color:"#f87171" },
                           { label:"Months",   value:clientMonths.length, color:"#c4b5fd" },
                         ].map(s => (
                           <div key={s.label} style={{ background:"rgba(255,255,255,0.03)", borderRadius:10, padding:"10px 12px" }}>
@@ -1400,6 +1540,26 @@ ${embeddedContent}
                       {client.phone && <div style={{ fontSize:12, color:C.muted, marginBottom:4 }}>📞 {client.phone}</div>}
                       {client.website && <div style={{ fontSize:12, color:C.muted, marginBottom:8 }}>🌐 {client.website}</div>}
                       {client.notes && <div style={{ fontSize:12, color:C.muted2, background:"rgba(255,255,255,0.02)", borderRadius:8, padding:"8px 10px", marginBottom:12 }}>{client.notes}</div>}
+
+                      {/* Content profile summary */}
+                      <div onClick={() => openProfile(client)}
+                        style={{ background:"rgba(20,184,166,0.05)", border:"1px solid rgba(20,184,166,0.18)", borderRadius:10, padding:"10px 12px", marginBottom:12, cursor:"pointer" }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+                          <span style={{ fontSize:11, color:C.teal, fontWeight:600 }}>🎯 CONTENT PROFILE</span>
+                          <span style={{ fontSize:11, color:C.muted }}>manage ›</span>
+                        </div>
+                        <div style={{ fontSize:11, color:C.muted }}>
+                          <span style={{ color: client.keywords?.length ? "#86efac" : "#fbbf24" }}>
+                            {client.keywords?.length || 0} keyword{client.keywords?.length === 1 ? "" : "s"}
+                          </span>
+                          {" · "}
+                          <span style={{ color: client.topics?.length ? "#86efac" : "#fbbf24" }}>
+                            {client.topics?.length || 0} topic{client.topics?.length === 1 ? "" : "s"}
+                          </span>
+                          {!client.keywords?.length && <span style={{ color:C.muted2 }}> — using global defaults</span>}
+                        </div>
+                        {client.niche && <div style={{ fontSize:11, color:C.muted2, marginTop:4 }}>Niche: {client.niche}</div>}
+                      </div>
 
                       <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:12 }}>
                         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
@@ -1502,7 +1662,7 @@ ${embeddedContent}
           const site = getSite(md.siteId);
           const client = getClient(md.clientId);
           const firstDate = arts[0]?.scheduledAt;
-          const lastDate = arts[9]?.scheduledAt;
+          const lastDate = arts[arts.length - 1]?.scheduledAt;
           return (
             <div style={{ padding:32 }}>
               <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:24 }}>
@@ -1598,18 +1758,19 @@ ${embeddedContent}
                     {arts.map((a, i) => {
                       const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
                       const isPast = dt && dt < new Date();
-                      const statusColors = { published:"#14b8a6", ready:"#22c55e", error:"#f87171", pending:C.muted2 };
+                      const statusColors = { published:"#14b8a6", published_now:"#38bdf8", ready:"#22c55e", error:"#f87171", pending:C.muted2 };
                       const col = statusColors[a.status] || C.muted2;
+                      const isLive = LIVE_STATUSES.includes(a.status);
                       return (
-                        <div key={a.id} onClick={() => setSelectedArticle(a.id)} style={{ background:"rgba(255,255,255,0.03)", border:`1px solid ${a.status==="published" ? "rgba(20,184,166,0.3)" : C.border}`, borderRadius:10, padding:"10px 12px", cursor:"pointer", transition:"all 0.2s" }}
+                        <div key={a.id} onClick={() => setSelectedArticle(a.id)} style={{ background:"rgba(255,255,255,0.03)", border:`1px solid ${isLive ? "rgba(20,184,166,0.3)" : C.border}`, borderRadius:10, padding:"10px 12px", cursor:"pointer", transition:"all 0.2s" }}
                           onMouseEnter={e => e.currentTarget.style.borderColor=C.border2}
-                          onMouseLeave={e => e.currentTarget.style.borderColor = a.status==="published"?"rgba(20,184,166,0.3)":C.border}>
+                          onMouseLeave={e => e.currentTarget.style.borderColor = isLive ? "rgba(20,184,166,0.3)" : C.border}>
                           <div style={{ fontSize:10, color:C.muted2, marginBottom:4 }}>Article {i+1}</div>
                           {dt && <div style={{ fontSize:12, fontWeight:600, color: isPast ? C.muted : C.text }}>{dt.toLocaleDateString([],{month:"short",day:"numeric"})}</div>}
                           {dt && <div style={{ fontSize:10, color:C.muted2 }}>{dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</div>}
                           <div style={{ marginTop:6, display:"flex", alignItems:"center", gap:4 }}>
                             <span style={{ width:5, height:5, borderRadius:"50%", background:col }} />
-                            <span style={{ fontSize:10, color:col }}>{a.status==="published"?"Scheduled":a.status}</span>
+                            <span style={{ fontSize:10, color:col }}>{a.status==="published"?"Scheduled":a.status==="published_now"?"Published":a.status}</span>
                           </div>
                         </div>
                       );
@@ -1765,7 +1926,21 @@ ${embeddedContent}
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
                 <h3 style={{ margin:"0 0 16px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🤖 Grok AI (xAI)</h3>
-                <Field label="API Key" value={config.grokKey} onChange={v => setConfig(p=>({...p,grokKey:v}))} type="password" placeholder="xai-..." mono hint="Get your key at console.x.ai" />
+                {/* A saved key is shown read-only — editing it in place would
+                    produce a half-mask the server cannot resolve. */}
+                {isMasked(config.grokKey) ? (
+                  <div style={{ marginBottom:16 }}>
+                    <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:500, letterSpacing:"0.05em", textTransform:"uppercase" }}>API Key</label>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <div style={{ flex:1, padding:"10px 14px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:10, color:C.muted, fontSize:13, fontFamily:"'JetBrains Mono',monospace" }}>{config.grokKey}</div>
+                      <Btn small variant="ghost" onClick={() => setConfig(p=>({...p,grokKey:""}))}>Replace</Btn>
+                    </div>
+                    <p style={{ fontSize:11, color:C.muted2, marginTop:5, lineHeight:1.5 }}>✓ Stored on the server — never sent to the browser.</p>
+                  </div>
+                ) : (
+                  <Field label="API Key" value={config.grokKey} onChange={v => setConfig(p=>({...p,grokKey:v}))} type="password" placeholder="xai-..." mono
+                    hint="Saved to the database server-side; it is never included in the page. Get your key at console.x.ai" />
+                )}
                 <Select label="Model" value={config.grokModel || "grok-3-mini"} onChange={v => setConfig(p=>({...p,grokModel:v}))}
                   options={[
                     { value:"grok-3-mini",  label:"grok-3-mini  ← recommended (affordable, fast)" },
@@ -1774,14 +1949,19 @@ ${embeddedContent}
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
                 <h3 style={{ margin:"0 0 6px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>📷 Unsplash API Keys</h3>
-                <p style={{ fontSize:11, color:C.muted2, marginBottom:12, lineHeight:1.6 }}>Add up to 3 keys (50 req/hour each). Pipeline auto-switches when one hits its limit.</p>
+                <p style={{ fontSize:11, color:C.muted2, marginBottom:12, lineHeight:1.6 }}>Add up to 3 keys (50 req/hour each). The server rotates them when one hits its limit. Saved keys show as <code>••••••••</code> — overwrite a field to replace that key.</p>
                 <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:12 }}>
                   {(config.unsplashKeys||[]).map((k,i) => (
                     <div key={i} style={{ display:"flex", alignItems:"center", gap:8 }}>
                       <span style={{ fontSize:11, color:C.muted, width:56, flexShrink:0 }}>Key {i+1}</span>
-                      <input value={k} onChange={e => setConfig(p => { const keys=[...p.unsplashKeys]; keys[i]=e.target.value; return {...p,unsplashKeys:keys}; })}
-                        style={{ flex:1, padding:"8px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:8, color:C.text, fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}
-                        onFocus={e=>e.target.style.borderColor=C.teal} onBlur={e=>e.target.style.borderColor=C.border2} />
+                      {/* Saved keys are read-only — remove and re-add to change one */}
+                      {isMasked(k) ? (
+                        <div style={{ flex:1, padding:"8px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:8, color:C.muted, fontSize:11, fontFamily:"'JetBrains Mono',monospace" }}>{k}</div>
+                      ) : (
+                        <input value={k} onChange={e => setConfig(p => { const keys=[...p.unsplashKeys]; keys[i]=e.target.value; return {...p,unsplashKeys:keys}; })}
+                          style={{ flex:1, padding:"8px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:8, color:C.text, fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}
+                          onFocus={e=>e.target.style.borderColor=C.teal} onBlur={e=>e.target.style.borderColor=C.border2} />
+                      )}
                       <button onClick={() => setConfig(p => ({...p, unsplashKeys: p.unsplashKeys.filter((_,j)=>j!==i)}))}
                         style={{ background:"none", border:"none", color:"#f87171", cursor:"pointer", fontSize:16, padding:"0 4px" }}>×</button>
                     </div>
@@ -1797,14 +1977,17 @@ ${embeddedContent}
                 <p style={{ fontSize:11, color:C.muted2, marginTop:8 }}>{(config.unsplashKeys||[]).length} key(s) · ~{(config.unsplashKeys||[]).length * 50} req/hour total</p>
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
-                <h3 style={{ margin:"0 0 16px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>💰 Default Pricing</h3>
+                <h3 style={{ margin:"0 0 16px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>💰 Global Defaults</h3>
                 <Field label="Currency Symbol" value={config.currency||"Rs"} onChange={v => setConfig(p=>({...p,currency:v}))} placeholder="Rs" hint="e.g. Rs · $ · £ · €" />
-                <Field label={`Price per Month (${config.currency||"Rs"})`} value={config.pricePerMonth} onChange={v => setConfig(p=>({...p,pricePerMonth:parseFloat(v)||0}))} type="number" hint="10 articles per month" />
+                <Field label={`Price per Month (${cur})`} value={config.pricePerMonth} onChange={v => setConfig(p=>({...p,pricePerMonth:parseFloat(v)||0}))} type="number" hint="Used for clients with no price of their own" />
+                <Field label="Default Niche" value={config.niche||""} onChange={v => setConfig(p=>({...p,niche:v}))} placeholder="Sri Lanka tours and travel"
+                  hint="Fallback for clients with no niche set — shapes AI prompts and image searches." />
               </div>
               <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24, gridColumn:"1 / -1" }}>
-                <h3 style={{ margin:"0 0 6px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🎯 Target Keywords</h3>
+                <h3 style={{ margin:"0 0 6px", fontSize:13, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>🎯 Fallback Target Keywords</h3>
                 <p style={{ fontSize:12, color:C.muted2, marginBottom:14, lineHeight:1.6 }}>
-                  These service keywords are randomly picked (2–3 per article) and naturally woven into content by Grok. Great for SEO ranking on your core services.
+                  Used only for clients that have no keywords of their own. 2–3 are picked at random per article and woven into the content by Grok.
+                  Manage per-client keywords in <strong style={{ color:C.muted }}>Clients → 🎯 Profile</strong>.
                 </p>
                 <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
                   {targetKeywords.map((kw, i) => (
@@ -1830,6 +2013,9 @@ ${embeddedContent}
                 <p style={{ fontSize:12, color:C.muted2, marginBottom:16, lineHeight:1.6 }}>
                   All data is stored in <strong style={{ color:C.muted }}>PostgreSQL</strong> on your VPS — safe across browser clears and redeployments.
                   Export a JSON backup as an extra safety net.
+                  <br />
+                  <strong style={{ color:"#fde68a" }}>Note:</strong> API keys and WordPress passwords are held server-side and appear in the export only as <code>••••••••</code> placeholders.
+                  Importing into a fresh database will need those re-entered.
                 </p>
                 <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
                   <Btn onClick={exportData}>↓ Export Backup</Btn>
@@ -1857,7 +2043,20 @@ ${embeddedContent}
             <Field label="Site Name" value={siteForm.name} onChange={v => setSiteForm(p=>({...p,name:v}))} placeholder="e.g. Wonders of Lanka" />
             <Field label="WordPress URL" value={siteForm.url} onChange={v => setSiteForm(p=>({...p,url:v}))} placeholder="https://wondersoflanka.com" mono hint="No trailing slash — root domain of your WP site" />
             <Field label="WordPress Username" value={siteForm.user} onChange={v => setSiteForm(p=>({...p,user:v}))} placeholder="admin" />
-            <Field label="Application Password" value={siteForm.appPass} onChange={v => setSiteForm(p=>({...p,appPass:v}))} type="password" placeholder="xxxx xxxx xxxx xxxx xxxx xxxx" mono hint="WP Admin → Users → Profile → Application Passwords → Add New" />
+            {/* A saved password stays on the server; show it read-only so it
+                cannot be half-edited into an unresolvable value. */}
+            {isMasked(siteForm.appPass) ? (
+              <div style={{ marginBottom:16 }}>
+                <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:500, letterSpacing:"0.05em", textTransform:"uppercase" }}>Application Password</label>
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  <div style={{ flex:1, padding:"10px 14px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:10, color:C.muted, fontSize:13, fontFamily:"'JetBrains Mono',monospace" }}>{siteForm.appPass}</div>
+                  <Btn small variant="ghost" onClick={() => setSiteForm(p=>({...p,appPass:""}))}>Replace</Btn>
+                </div>
+                <p style={{ fontSize:11, color:C.muted2, marginTop:5, lineHeight:1.5 }}>✓ Stored on the server — never sent to the browser.</p>
+              </div>
+            ) : (
+              <Field label="Application Password" value={siteForm.appPass} onChange={v => setSiteForm(p=>({...p,appPass:v}))} type="password" placeholder="xxxx xxxx xxxx xxxx xxxx xxxx" mono hint="WP Admin → Users → Profile → Application Passwords → Add New" />
+            )}
             <Select label="Link to Client (optional)" value={siteForm.clientId} onChange={v => setSiteForm(p=>({...p,clientId:v}))}
               options={[{ value:"", label:"— No client —" }, ...clients.map(c => ({ value:c.id, label:c.name }))]} />
 
@@ -1891,6 +2090,12 @@ ${embeddedContent}
             <Field label="Email" value={clientForm.email} onChange={v => setClientForm(p=>({...p,email:v}))} type="email" placeholder="client@example.com" />
             <Field label="Phone" value={clientForm.phone} onChange={v => setClientForm(p=>({...p,phone:v}))} placeholder="+1 234 567 8900" />
             <Field label="Website" value={clientForm.website} onChange={v => setClientForm(p=>({...p,website:v}))} placeholder="https://client.com" mono />
+            <Field label="Niche" value={clientForm.niche} onChange={v => setClientForm(p=>({...p,niche:v}))}
+              placeholder="e.g. Sri Lanka tours and travel"
+              hint="What this client's business is about — drives every AI prompt and image search. Blank uses the global default." />
+            <Field label={`Price per Month (${cur}) — optional`} value={clientForm.pricePerMonth} onChange={v => setClientForm(p=>({...p,pricePerMonth:v}))} type="number"
+              placeholder={String(config.pricePerMonth ?? 0)}
+              hint="Leave blank to bill this client at the global default." />
             <div style={{ marginBottom:16 }}>
               <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:500, letterSpacing:"0.05em", textTransform:"uppercase" }}>Notes</label>
               <textarea value={clientForm.notes} onChange={e => setClientForm(p=>({...p,notes:e.target.value}))} placeholder="Any notes about this client…" rows={3}
@@ -1905,6 +2110,158 @@ ${embeddedContent}
           </div>
         </div>
       )}
+
+      {/* ── CONTENT PROFILE MODAL (keywords + topic bank) ── */}
+      {profileClientId && (() => {
+        const pc = clients.find(c => c.id === profileClientId);
+        if (!pc) return null;
+        const kws = pc.keywords || [];
+        const tps = pc.topics || [];
+        const term = kwSearch.trim().toLowerCase();
+        const shown = term ? kws.filter(k => k.toLowerCase().includes(term)) : kws;
+        const inputStyle = { width:"100%", padding:"9px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:9, color:C.text, fontSize:12, outline:"none", boxSizing:"border-box" };
+        return (
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.8)", backdropFilter:"blur(6px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:999 }} onClick={() => setProfileClientId(null)}>
+            <div onClick={e => e.stopPropagation()} style={{ background:"#0d1117", border:`1px solid ${C.border2}`, borderRadius:20, width:"min(860px,95vw)", maxHeight:"90vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.7)", overflow:"hidden" }}>
+
+              {/* Header */}
+              <div style={{ padding:"20px 24px 0", flexShrink:0 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+                  <div>
+                    <h3 style={{ margin:0, fontSize:18, fontWeight:800, color:C.text }}>🎯 Content Profile — {pc.name}</h3>
+                    <p style={{ margin:"4px 0 0", fontSize:12, color:C.muted }}>
+                      Keywords are woven into every article for this client; topics are the pool months draw from.
+                      {pc.niche ? ` Niche: ${pc.niche}` : " No niche set — edit the client to add one."}
+                    </p>
+                  </div>
+                  <button onClick={() => setProfileClientId(null)} style={{ background:"none", border:"none", color:C.muted, fontSize:20, cursor:"pointer", lineHeight:1 }}>×</button>
+                </div>
+                <div style={{ display:"flex", gap:4, marginTop:16, borderBottom:`1px solid ${C.border}` }}>
+                  {[["keywords",`Keywords (${kws.length})`],["topics",`Topics (${tps.length})`]].map(([id,label]) => (
+                    <button key={id} onClick={() => setProfileTab(id)}
+                      style={{ padding:"8px 16px", border:"none", borderBottom:`2px solid ${profileTab===id ? C.teal : "transparent"}`, background:"transparent", color: profileTab===id ? C.teal : C.muted, fontSize:12, fontWeight:600, cursor:"pointer" }}
+                    >{label}</button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Body */}
+              <div style={{ flex:1, overflowY:"auto", padding:"20px 24px 24px", minHeight:0 }}>
+
+                {profileTab === "keywords" ? (
+                  <>
+                    <div style={{ marginBottom:16 }}>
+                      <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:600, letterSpacing:"0.05em", textTransform:"uppercase" }}>Add keywords in bulk</label>
+                      <textarea value={kwBulk} onChange={e => setKwBulk(e.target.value)} rows={4}
+                        placeholder={"Paste one per line, or comma-separated:\nSri Lanka tour guide and driver\nHoneymoon tours Sri Lanka, Culture tours Sri Lanka"}
+                        style={{ ...inputStyle, resize:"vertical", fontFamily:"'JetBrains Mono',monospace", lineHeight:1.6 }}
+                        onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:8 }}>
+                        <span style={{ fontSize:11, color:C.muted2 }}>Duplicates are skipped automatically (case-insensitive).</span>
+                        <Btn small onClick={() => addKeywords(pc.id, kwBulk)} disabled={!kwBulk.trim()}>+ Add {parseKeywordList(kwBulk).length || ""} Keyword(s)</Btn>
+                      </div>
+                    </div>
+
+                    <div style={{ display:"flex", gap:10, alignItems:"center", marginBottom:12 }}>
+                      <input value={kwSearch} onChange={e => setKwSearch(e.target.value)} placeholder="Filter keywords…"
+                        style={{ ...inputStyle, flex:1 }}
+                        onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                      <span style={{ fontSize:11, color:C.muted, whiteSpace:"nowrap" }}>{shown.length} of {kws.length}</span>
+                      {kws.length > 0 && (
+                        <Btn small variant="danger" onClick={() => { if (confirm(`Remove all ${kws.length} keywords from ${pc.name}?`)) updateClient(pc.id, { keywords: [] }); }}>Clear all</Btn>
+                      )}
+                    </div>
+
+                    {kws.length === 0 ? (
+                      <div style={{ background:"rgba(251,191,36,0.06)", border:"1px solid rgba(251,191,36,0.25)", borderRadius:10, padding:"14px 16px", fontSize:12, color:"#fde68a", lineHeight:1.6 }}>
+                        No keywords yet — this client falls back to the {targetKeywords.length} global keyword(s) from Settings.
+                      </div>
+                    ) : shown.length === 0 ? (
+                      <div style={{ fontSize:12, color:C.muted2, padding:"14px 0" }}>No keywords match "{kwSearch}".</div>
+                    ) : (
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
+                        {shown.map(kw => (
+                          <span key={kw} style={{ display:"flex", alignItems:"center", gap:8, background:"rgba(20,184,166,0.08)", border:"1px solid rgba(20,184,166,0.25)", borderRadius:8, padding:"6px 10px", fontSize:12, color:C.teal }}>
+                            {kw}
+                            <button onClick={() => removeKeyword(pc.id, kw)} title="Remove"
+                              style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:14, lineHeight:1, padding:0 }}>×</button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div style={{ marginBottom:18 }}>
+                      <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:600, letterSpacing:"0.05em", textTransform:"uppercase" }}>Add a topic</label>
+                      <div style={{ display:"grid", gridTemplateColumns:"2fr 2fr 1.2fr auto", gap:8, alignItems:"center" }}>
+                        <input value={topicForm.title} onChange={e => setTopicForm(p=>({...p,title:e.target.value}))} placeholder="Article title"
+                          style={inputStyle} onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                        <input value={topicForm.keywords} onChange={e => setTopicForm(p=>({...p,keywords:e.target.value}))} placeholder="Topic keywords"
+                          style={inputStyle} onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                        <select value={topicForm.category} onChange={e => setTopicForm(p=>({...p,category:e.target.value}))}
+                          style={{ ...inputStyle, cursor:"pointer" }}>
+                          {Object.keys(CAT).map(k => <option key={k} value={k}>{k}</option>)}
+                        </select>
+                        <Btn small onClick={() => addTopic(pc.id, topicForm)} disabled={!topicForm.title.trim()}>+ Add</Btn>
+                      </div>
+                    </div>
+
+                    <div style={{ marginBottom:18 }}>
+                      <label style={{ display:"block", fontSize:11, color:C.muted, marginBottom:6, fontWeight:600, letterSpacing:"0.05em", textTransform:"uppercase" }}>Add topics in bulk</label>
+                      <textarea value={topicBulk} onChange={e => setTopicBulk(e.target.value)} rows={4}
+                        placeholder={"One per line — Title | keywords | Category\nTop 10 Beaches in Bali | Bali beaches, Seminyak | Destinations\nBali Food Guide | Balinese cuisine | Food & Culture"}
+                        style={{ ...inputStyle, resize:"vertical", fontFamily:"'JetBrains Mono',monospace", lineHeight:1.6 }}
+                        onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:8 }}>
+                        <span style={{ fontSize:11, color:C.muted2 }}>Keywords and category are optional; unknown categories become "Destinations".</span>
+                        <Btn small onClick={() => addTopicsBulk(pc.id, topicBulk)} disabled={!topicBulk.trim()}>+ Add Topics</Btn>
+                      </div>
+                    </div>
+
+                    {tps.length === 0 ? (
+                      <div style={{ background:"rgba(251,191,36,0.06)", border:"1px solid rgba(251,191,36,0.25)", borderRadius:10, padding:"14px 16px", fontSize:12, color:"#fde68a", lineHeight:1.6 }}>
+                        No topics yet — new months for this client draw from the {TOPIC_BANK.length} built-in Sri Lanka topics. Add topics here to make months client-specific.
+                      </div>
+                    ) : (
+                      <>
+                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+                          <span style={{ fontSize:11, color:C.muted }}>
+                            {tps.length} topic(s) · a month draws 10 at random{tps.length < 10 ? ` — only ${tps.length} available, so months will have ${tps.length} articles` : ""}
+                          </span>
+                          <Btn small variant="danger" onClick={() => { if (confirm(`Remove all ${tps.length} topics from ${pc.name}?`)) updateClient(pc.id, { topics: [] }); }}>Clear all</Btn>
+                        </div>
+                        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                          {tps.map((t, i) => {
+                            const cs = CAT[t.category] || CAT["Destinations"];
+                            return (
+                              <div key={`${t.title}-${i}`} style={{ display:"flex", alignItems:"center", gap:10, background:"rgba(255,255,255,0.03)", border:`1px solid ${C.border}`, borderRadius:9, padding:"9px 12px" }}>
+                                <span style={{ fontSize:10, color:C.muted2, fontFamily:"'JetBrains Mono',monospace", width:24, flexShrink:0 }}>{String(i+1).padStart(2,"0")}</span>
+                                <div style={{ flex:1, minWidth:0 }}>
+                                  <div style={{ fontSize:12, fontWeight:600, color:C.text }}>{t.title}</div>
+                                  {t.keywords && <div style={{ fontSize:11, color:C.muted2, marginTop:2 }}>{t.keywords}</div>}
+                                </div>
+                                <span style={{ fontSize:10, color:cs.text, background:cs.grad, padding:"3px 9px", borderRadius:6, flexShrink:0 }}>{t.category}</span>
+                                <button onClick={() => removeTopic(pc.id, i)} title="Remove"
+                                  style={{ background:"none", border:"none", color:"#f87171", cursor:"pointer", fontSize:15, lineHeight:1, padding:"0 2px" }}>×</button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+
+              <div style={{ padding:"14px 24px", borderTop:`1px solid ${C.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 }}>
+                <span style={{ fontSize:11, color:C.muted2 }}>Changes save automatically.</span>
+                <Btn onClick={() => setProfileClientId(null)}>Done</Btn>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── TEST ARTICLE MODAL ── */}
       {showTestModal && (
@@ -1923,6 +2280,25 @@ ${embeddedContent}
             <div style={{ display:"flex", flex:1, minHeight:0 }}>
               {/* Left panel — config */}
               <div style={{ width:280, borderRight:`1px solid ${C.border}`, padding:20, overflowY:"auto", flexShrink:0 }}>
+                {/* Client — decides brand, niche, keywords and topic bank */}
+                <div style={{ marginBottom:16 }}>
+                  <label style={{ fontSize:11, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.05em", display:"block", marginBottom:8 }}>Client Profile</label>
+                  <select value={testClientId} onChange={e => { setTestClientId(e.target.value); setTestTopicIdx(0); }}
+                    style={{ width:"100%", padding:"9px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:9, color:C.text, fontSize:12, outline:"none" }}>
+                    <option value="">— Global defaults —</option>
+                    {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                  {(() => {
+                    const p = profileForClient(getClient(testClientId), null);
+                    return (
+                      <div style={{ marginTop:8, padding:"8px 10px", background:"rgba(20,184,166,0.06)", border:"1px solid rgba(20,184,166,0.18)", borderRadius:8, fontSize:11, color:C.muted, lineHeight:1.6 }}>
+                        <div>{p.name} · {p.website}</div>
+                        <div style={{ color:C.muted2 }}>{p.keywords.length} keyword(s) · {testBank.length} topic(s)</div>
+                      </div>
+                    );
+                  })()}
+                </div>
+
                 {/* Topic source toggle */}
                 <div style={{ marginBottom:16 }}>
                   <label style={{ fontSize:11, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.05em", display:"block", marginBottom:8 }}>Topic Source</label>
@@ -1938,14 +2314,16 @@ ${embeddedContent}
                 {!testUseCustom ? (
                   <div style={{ marginBottom:16 }}>
                     <label style={{ fontSize:11, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.05em", display:"block", marginBottom:8 }}>Select Topic</label>
-                    <select value={testTopicIdx} onChange={e => setTestTopicIdx(Number(e.target.value))}
+                    <select value={Math.min(testTopicIdx, testBank.length - 1)} onChange={e => setTestTopicIdx(Number(e.target.value))}
                       style={{ width:"100%", padding:"9px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:9, color:C.text, fontSize:12, outline:"none" }}>
-                      {TOPIC_BANK.map((t, i) => <option key={i} value={i}>{t.title}</option>)}
+                      {testBank.map((t, i) => <option key={i} value={i}>{t.title}</option>)}
                     </select>
-                    <div style={{ marginTop:8, padding:"8px 10px", background:"rgba(255,255,255,0.03)", borderRadius:8, fontSize:11, color:C.muted }}>
-                      <div style={{ marginBottom:3 }}><span style={{ color:C.muted2 }}>Keywords:</span> {TOPIC_BANK[testTopicIdx].keywords}</div>
-                      <div><span style={{ color:C.muted2 }}>Category:</span> {TOPIC_BANK[testTopicIdx].category}</div>
-                    </div>
+                    {testTopic && (
+                      <div style={{ marginTop:8, padding:"8px 10px", background:"rgba(255,255,255,0.03)", borderRadius:8, fontSize:11, color:C.muted }}>
+                        <div style={{ marginBottom:3 }}><span style={{ color:C.muted2 }}>Keywords:</span> {testTopic.keywords}</div>
+                        <div><span style={{ color:C.muted2 }}>Category:</span> {testTopic.category}</div>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div>
@@ -2076,7 +2454,7 @@ ${embeddedContent}
         <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(4px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:999 }} onClick={() => setShowNewMonth(false)}>
           <div onClick={e => e.stopPropagation()} style={{ background:"#0f1623", border:`1px solid ${C.border2}`, borderRadius:18, padding:28, width:440, boxShadow:"0 24px 64px rgba(0,0,0,0.6)", maxHeight:"90vh", overflowY:"auto" }}>
             <h3 style={{ margin:"0 0 6px", fontSize:18, fontWeight:800, color:C.text }}>Create New Month</h3>
-            <p style={{ fontSize:12, color:C.muted, marginBottom:22 }}>10 articles will be assigned and scheduled 1 per day with a gap day between each (every 2 days).</p>
+            <p style={{ fontSize:12, color:C.muted, marginBottom:22 }}>{nmCount} article{nmCount===1?"":"s"} will be assigned and scheduled 1 per day with a gap day between each (every 2 days).</p>
 
             <Field label="Month (YYYY-MM)" value={nmDate} onChange={setNmDate} placeholder="2026-05" mono />
             <Select label="Article Language" value={nmLanguage} onChange={setNmLanguage}
@@ -2089,6 +2467,13 @@ ${embeddedContent}
               ]} />
             <Select label="Client" value={nmClientId} onChange={v => { setNmClientId(v); setNmSiteId(""); }}
               options={[{ value:"", label:"— No client —" }, ...clients.map(c => ({ value:c.id, label:c.name }))]} />
+
+            <div style={{ background: nmUsesClientTopics ? "rgba(20,184,166,0.06)" : "rgba(251,191,36,0.06)", border:`1px solid ${nmUsesClientTopics ? "rgba(20,184,166,0.2)" : "rgba(251,191,36,0.25)"}`, borderRadius:10, padding:"10px 14px", marginBottom:16, fontSize:11, lineHeight:1.6, color: nmUsesClientTopics ? C.teal : "#fde68a" }}>
+              {nmUsesClientTopics
+                ? `Drawing from this client's own topic bank (${nmBank.length} topics).`
+                : `No client topic bank — using the ${nmBank.length} built-in topics. Add topics in the client's Content Profile to make months client-specific.`}
+            </div>
+
             <Select label="WordPress Site" value={nmSiteId} onChange={setNmSiteId}
               options={[
                 { value:"", label:"— No site (generate only) —" },
@@ -2104,7 +2489,7 @@ ${embeddedContent}
             <div style={{ background:"rgba(129,140,248,0.06)", border:"1px solid rgba(129,140,248,0.2)", borderRadius:10, padding:"12px 14px", marginBottom:16 }}>
               <div style={{ fontSize:11, color:"#a5b4fc", fontWeight:600, marginBottom:8 }}>📅 Schedule Preview</div>
               <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-                {buildSchedule(nmStartDate, nmTime).map((dt, i) => (
+                {buildSchedule(nmStartDate, nmTime, nmCount).map((dt, i) => (
                   <span key={i} style={{ fontSize:10, color:C.muted, background:"rgba(255,255,255,0.05)", padding:"3px 8px", borderRadius:5, fontFamily:"'JetBrains Mono',monospace" }}>
                     #{i+1} {new Date(dt).toLocaleDateString([],{month:"short",day:"numeric"})}
                   </span>
