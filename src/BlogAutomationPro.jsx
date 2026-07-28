@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { getMonthKey, getMonthLabel, filterMonths, rollupMonths } from "./monthFilters";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
 let _appKey = (() => { try { return sessionStorage.getItem("blog_app_key") || ""; } catch { return ""; } })();
@@ -58,9 +59,6 @@ const isMasked = (v) => typeof v === "string" && v.startsWith(MASK);
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 // ─── HELPERS ─────────────────────────────────────────────────────
-const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-const getMonthKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
-const getMonthLabel = (key) => { const [y,m] = key.split("-"); return `${MONTHS[parseInt(m)-1]} ${y}`; };
 const tomorrow = () => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().slice(0,10); };
 
 const TOPIC_BANK = [
@@ -353,6 +351,12 @@ export default function BlogAutomationPro() {
   const [topicBulk, setTopicBulk] = useState("");
   const [topicForm, setTopicForm] = useState({ title:"", keywords:"", category:"Destinations" });
 
+  // Months management page filters
+  const [mfClient, setMfClient] = useState("");
+  const [mfStatus, setMfStatus] = useState("all");   // all | unpaid | partial | paid
+  const [mfSearch, setMfSearch] = useState("");
+  const [mfSort, setMfSort] = useState("newest");    // newest | oldest | client
+
   // New month config
   const [nmDate, setNmDate] = useState(getMonthKey());
   const [nmClientId, setNmClientId] = useState("");
@@ -621,7 +625,29 @@ export default function BlogAutomationPro() {
     setNav("month");
   };
 
-  const markPaid = (k) => setPayments(p => p.map(x => x.monthKey===k ? { ...x, status:"paid", paidAt:new Date().toISOString() } : x));
+  // Upserts, because months created before payments existed have no record
+  const upsertPayment = (k, patch) => setPayments(p => {
+    if (p.some(x => x.monthKey === k)) return p.map(x => x.monthKey===k ? { ...x, ...patch } : x);
+    const md = months[k];
+    return [...p, {
+      monthKey: k,
+      status: "unpaid",
+      amount: clients.find(c => c.id===md?.clientId)?.pricePerMonth ?? config.pricePerMonth,
+      paidAt: null,
+      clientId: md?.clientId,
+      ...patch,
+    }];
+  });
+
+  const setPaymentStatus = (k, status) => upsertPayment(k, {
+    status,
+    // Keep the original paid date when re-confirming; clear it when reverting
+    paidAt: status === "paid" ? (getPayment(k).paidAt || new Date().toISOString()) : null,
+  });
+
+  const setPaymentAmount = (k, amount) => upsertPayment(k, { amount });
+
+  const markPaid = (k) => setPaymentStatus(k, "paid");
 
   const exportData = () => {
     const data = { months, clients, sites, payments, config, exportedAt: new Date().toISOString(), version: "wol-blog-automation-v3" };
@@ -1286,6 +1312,15 @@ ${embeddedContent}
   );
 
   const cur = config.currency || "Rs";
+
+  // ─── MONTHS PAGE: filtering + rollup ────────────────────────
+  const monthKeys = Object.keys(months);
+  const filteredMonthKeys = filterMonths({
+    months, payments, clients, sites,
+    clientId: mfClient, status: mfStatus, search: mfSearch, sort: mfSort,
+  });
+  const mfRollup = rollupMonths({ keys: filteredMonthKeys, months, payments, liveStatuses: LIVE_STATUSES });
+
   const testBank = topicBankFor(testClientId);
   const testTopic = testBank[Math.min(testTopicIdx, testBank.length - 1)];
   const nmBank = topicBankFor(nmClientId);
@@ -1298,6 +1333,7 @@ ${embeddedContent}
 
   const NAV = [
     { id:"dashboard", icon:"⊞", label:"Dashboard" },
+    { id:"months",    icon:"🗓", label:"Months",   badge: monthKeys.length },
     { id:"clients",   icon:"👥", label:"Clients",  badge: clients.length },
     { id:"sites",     icon:"🔗", label:"Sites",    badge: sites.length },
     { id:"payments",  icon:"◈", label:"Payments" },
@@ -1478,6 +1514,181 @@ ${embeddedContent}
             )}
           </div>
         )}
+
+        {/* ── MONTHS (management) ── */}
+        {nav==="months" && (() => {
+          const ctlStyle = { padding:"9px 12px", background:"#0a0f1a", border:`1px solid ${C.border2}`, borderRadius:9, color:C.text, fontSize:12, outline:"none", boxSizing:"border-box", width:"100%" };
+          const filtersOn = mfClient || mfStatus !== "all" || mfSearch.trim();
+          return (
+            <div style={{ padding:32 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:24 }}>
+                <div>
+                  <h1 style={{ fontSize:26, fontWeight:800, color:C.text, letterSpacing:"-0.03em" }}>Months</h1>
+                  <p style={{ fontSize:13, color:C.muted, marginTop:4 }}>Filter by client, update billing, change the linked site, or remove a month.</p>
+                </div>
+                <Btn onClick={() => setShowNewMonth(true)}>+ New Month</Btn>
+              </div>
+
+              {/* Filters */}
+              <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:18, marginBottom:18 }}>
+                <div style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr 1fr 1.6fr", gap:10 }}>
+                  <div>
+                    <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>Client</label>
+                    <select value={mfClient} onChange={e => setMfClient(e.target.value)} style={{ ...ctlStyle, cursor:"pointer" }}>
+                      <option value="">All clients</option>
+                      {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>Payment</label>
+                    <select value={mfStatus} onChange={e => setMfStatus(e.target.value)} style={{ ...ctlStyle, cursor:"pointer" }}>
+                      <option value="all">All statuses</option>
+                      <option value="unpaid">Unpaid</option>
+                      <option value="partial">Partial</option>
+                      <option value="paid">Paid</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>Sort</label>
+                    <select value={mfSort} onChange={e => setMfSort(e.target.value)} style={{ ...ctlStyle, cursor:"pointer" }}>
+                      <option value="newest">Newest first</option>
+                      <option value="oldest">Oldest first</option>
+                      <option value="client">By client</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>Search</label>
+                    <input value={mfSearch} onChange={e => setMfSearch(e.target.value)} placeholder="Month, client or site…"
+                      style={ctlStyle} onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                  </div>
+                </div>
+                {filtersOn && (
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:12 }}>
+                    <span style={{ fontSize:11, color:C.muted }}>Showing {filteredMonthKeys.length} of {monthKeys.length} month(s)</span>
+                    <button onClick={() => { setMfClient(""); setMfStatus("all"); setMfSearch(""); }}
+                      style={{ background:"none", border:"none", color:C.teal, fontSize:11, cursor:"pointer", textDecoration:"underline", padding:0 }}>Clear filters</button>
+                  </div>
+                )}
+              </div>
+
+              {/* Rollup for the current filter */}
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:20 }}>
+                {[
+                  { label:"Months",      value:filteredMonthKeys.length, color:"#f59e0b" },
+                  { label:"Articles",    value:`${mfRollup.live}/${mfRollup.articles}`, color:"#38bdf8", sub:"live / total" },
+                  { label:"Paid",        value:`${cur} ${mfRollup.paid.toLocaleString()}`, color:"#22c55e" },
+                  { label:"Outstanding", value:`${cur} ${mfRollup.outstanding.toLocaleString()}`, color:"#f87171" },
+                ].map(s => (
+                  <div key={s.label} style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:"14px 18px" }}>
+                    <div style={{ fontSize:10, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:6 }}>{s.label}</div>
+                    <div style={{ fontSize:22, fontWeight:800, color:s.color }}>{s.value}</div>
+                    {s.sub && <div style={{ fontSize:10, color:C.muted2, marginTop:2 }}>{s.sub}</div>}
+                  </div>
+                ))}
+              </div>
+
+              {/* List */}
+              {monthKeys.length === 0 ? (
+                <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:48, textAlign:"center" }}>
+                  <div style={{ fontSize:36, marginBottom:12, opacity:0.3 }}>🗓</div>
+                  <p style={{ color:C.muted, marginBottom:20, fontSize:14 }}>No months yet.</p>
+                  <Btn onClick={() => setShowNewMonth(true)}>+ Create First Month</Btn>
+                </div>
+              ) : filteredMonthKeys.length === 0 ? (
+                <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:40, textAlign:"center" }}>
+                  <p style={{ color:C.muted, fontSize:13, marginBottom:14 }}>No months match these filters.</p>
+                  <Btn variant="ghost" small onClick={() => { setMfClient(""); setMfStatus("all"); setMfSearch(""); }}>Clear filters</Btn>
+                </div>
+              ) : (
+                <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+                  {filteredMonthKeys.map(key => {
+                    const md = months[key];
+                    const arts = md.articles || [];
+                    const pay = getPayment(key);
+                    const client = getClient(md.clientId);
+                    const site = getSite(md.siteId);
+                    const live = arts.filter(a => LIVE_STATUSES.includes(a.status)).length;
+                    const rdy  = arts.filter(a => a.status === "ready").length;
+                    const err  = arts.filter(a => a.status === "error").length;
+                    const pct  = arts.length ? Math.round(((live + rdy) / arts.length) * 100) : 0;
+                    const first = arts[0]?.scheduledAt;
+                    const last  = arts[arts.length - 1]?.scheduledAt;
+                    return (
+                      <div key={key} style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:"18px 20px" }}>
+
+                        {/* Identity row */}
+                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:16, marginBottom:12 }}>
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap", marginBottom:8 }}>
+                              <span onClick={() => { setSelectedMonth(key); setNav("month"); setSelectedArticle(null); }}
+                                style={{ fontSize:16, fontWeight:700, color:C.text, cursor:"pointer" }}
+                                onMouseEnter={e => e.currentTarget.style.color=C.teal}
+                                onMouseLeave={e => e.currentTarget.style.color=C.text}>{getMonthLabel(key)}</span>
+                              <PayBadge status={pay.status} />
+                              {client
+                                ? <span style={{ fontSize:11, color:"#d8b4fe", background:"rgba(192,132,252,0.1)", border:"1px solid rgba(192,132,252,0.2)", padding:"2px 8px", borderRadius:6 }}>👤 {client.name}</span>
+                                : <span style={{ fontSize:11, color:C.muted2, background:"rgba(255,255,255,0.03)", border:`1px solid ${C.border}`, padding:"2px 8px", borderRadius:6 }}>no client</span>}
+                              {md.language && md.language !== "en" && (
+                                <span style={{ fontSize:11, color:"#fde68a", background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.2)", padding:"2px 8px", borderRadius:6 }}>🌍 {LANG_NAMES[md.language]}</span>
+                              )}
+                              {err > 0 && <span style={{ fontSize:11, color:"#fca5a5", background:"rgba(239,68,68,0.1)", border:"1px solid rgba(239,68,68,0.25)", padding:"2px 8px", borderRadius:6 }}>⚠ {err} error{err>1?"s":""}</span>}
+                            </div>
+                            <div style={{ height:4, background:"#1a2234", borderRadius:99, width:"70%", overflow:"hidden", marginBottom:6 }}>
+                              <div style={{ height:"100%", width:`${pct}%`, background:`linear-gradient(90deg,${C.tealDim},${C.teal})`, borderRadius:99, transition:"width 0.5s" }} />
+                            </div>
+                            <div style={{ fontSize:11, color:C.muted }}>
+                              {live} live · {rdy} ready · {Math.max(0, arts.length - live - rdy)} pending · {arts.length} total
+                              {first && last && <span style={{ marginLeft:12, color:C.muted2 }}>📅 {new Date(first).toLocaleDateString()} → {new Date(last).toLocaleDateString()}</span>}
+                            </div>
+                          </div>
+                          <Btn small variant="ghost" onClick={() => { setSelectedMonth(key); setNav("month"); setSelectedArticle(null); }}>Open ›</Btn>
+                        </div>
+
+                        {/* Controls row */}
+                        <div style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr 1fr auto", gap:10, alignItems:"end", borderTop:`1px solid ${C.border}`, paddingTop:14 }}>
+                          <div>
+                            <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>WordPress site</label>
+                            <select value={md.siteId || ""} onChange={e => updateMonthSite(key, e.target.value)}
+                              style={{ ...ctlStyle, cursor:"pointer", color: md.siteId ? "#7dd3fc" : "#f87171", borderColor: md.siteId ? C.border2 : "rgba(239,68,68,0.35)" }}>
+                              <option value="">⚠ No site linked</option>
+                              {sites.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>Payment</label>
+                            <select value={pay.status || "unpaid"} onChange={e => setPaymentStatus(key, e.target.value)}
+                              style={{ ...ctlStyle, cursor:"pointer", color: pay.status==="paid" ? "#86efac" : pay.status==="partial" ? "#fde68a" : "#fca5a5" }}>
+                              <option value="unpaid">Unpaid</option>
+                              <option value="partial">Partial</option>
+                              <option value="paid">Paid</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label style={{ display:"block", fontSize:10, color:C.muted2, marginBottom:5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em" }}>Amount ({cur})</label>
+                            <input type="number" value={pay.amount ?? 0} onChange={e => setPaymentAmount(key, parseFloat(e.target.value) || 0)}
+                              style={ctlStyle} onFocus={e => e.target.style.borderColor=C.teal} onBlur={e => e.target.style.borderColor=C.border2} />
+                          </div>
+                          <div style={{ display:"flex", gap:6, paddingBottom:1 }}>
+                            <button onClick={() => autoExportArticles(key)} title="Download articles JSON"
+                              style={{ background:"rgba(56,189,248,0.08)", border:"1px solid rgba(56,189,248,0.2)", color:"#7dd3fc", borderRadius:9, padding:"9px 12px", fontSize:12, cursor:"pointer" }}>↓ JSON</button>
+                            <button onClick={() => downloadAllAsWord(key)} disabled={!arts.some(a => a.content)} title={arts.some(a => a.content) ? "Download all articles as Word (.zip)" : "No generated content yet"}
+                              style={{ background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", color: arts.some(a => a.content) ? "#a5b4fc" : C.muted2, borderRadius:9, padding:"9px 12px", fontSize:12, cursor: arts.some(a => a.content) ? "pointer" : "not-allowed" }}>📥 Word</button>
+                            <button onClick={() => deleteMonth(key)} title="Delete this month"
+                              style={{ background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.2)", color:"#f87171", borderRadius:9, padding:"9px 12px", fontSize:12, cursor:"pointer" }}>✕ Delete</button>
+                          </div>
+                        </div>
+
+                        {pay.status === "paid" && pay.paidAt && (
+                          <div style={{ fontSize:10, color:C.muted2, marginTop:8 }}>Paid on {new Date(pay.paidAt).toLocaleDateString()}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* ── CLIENTS ── */}
         {nav==="clients" && (
