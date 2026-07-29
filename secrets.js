@@ -6,13 +6,23 @@ const MASK = "••••••••";
 const mask     = (v) => (v ? MASK + String(v).slice(-4) : "");
 const isMasked = (v) => typeof v === "string" && v.startsWith(MASK);
 
+// Records written before multi-key rotation kept a single `unsplashAccessKey`.
+// Fold it into the list here so the server, and not the browser, owns the
+// migration — the browser only ever sees masked values and could not do it.
+const unsplashKeysOf = (cfg = {}) => {
+  const list = (cfg.unsplashKeys || []).filter(Boolean);
+  if (list.length) return list;
+  return cfg.unsplashAccessKey ? [cfg.unsplashAccessKey] : [];
+};
+
 const redactState = (state) => {
   const out = { ...state };
   if (out.config) {
     out.config = {
       ...out.config,
       grokKey: mask(out.config.grokKey),
-      unsplashKeys: (out.config.unsplashKeys || []).map(mask),
+      unsplashKeys: unsplashKeysOf(out.config).map(mask),
+      ...(out.config.unsplashAccessKey && { unsplashAccessKey: mask(out.config.unsplashAccessKey) }),
     };
   }
   if (Array.isArray(out.sites)) {
@@ -28,8 +38,9 @@ const unmaskState = (incoming, stored) => {
   if (out.config) {
     const cfg = { ...out.config };
     if (isMasked(cfg.grokKey)) cfg.grokKey = storedCfg.grokKey || "";
+    if (isMasked(cfg.unsplashAccessKey)) cfg.unsplashAccessKey = storedCfg.unsplashAccessKey || "";
     if (Array.isArray(cfg.unsplashKeys)) {
-      const prev = storedCfg.unsplashKeys || [];
+      const prev = unsplashKeysOf(storedCfg);
       cfg.unsplashKeys = cfg.unsplashKeys
         .map((k, i) => {
           if (!isMasked(k)) return k;
@@ -53,4 +64,4 @@ const unmaskState = (incoming, stored) => {
   return out;
 };
 
-module.exports = { MASK, mask, isMasked, redactState, unmaskState };
+module.exports = { MASK, mask, isMasked, redactState, unmaskState, unsplashKeysOf };

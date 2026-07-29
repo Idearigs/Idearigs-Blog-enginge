@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getMonthKey, getMonthLabel, filterMonths, rollupMonths } from "./monthFilters";
 import { collectForbiddenBrands, enforceBrand, normalizeDomain } from "./brandGuard";
+import {
+  MIN_WORDS, countWords, hasFaqSection, extractFaqPairs, buildFaqSchema,
+  insertBeforeFaq, boldKeywords, insertImages, seoReport,
+} from "./articleQuality";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
 let _appKey = (() => { try { return sessionStorage.getItem("blog_app_key") || ""; } catch { return ""; } })();
@@ -102,8 +106,8 @@ const LIVE_STATUSES = ["published", "published_now"];
 
 const STEPS = [
   { id: "title_gen",   icon: "✦", label: "SEO Title",  desc: "Generating optimized title & slug" },
-  { id: "content_gen", icon: "✎", label: "Content",    desc: "Writing 2000+ word article" },
-  { id: "images",      icon: "⬡", label: "Images",     desc: "Fetching 4–5 Unsplash photos" },
+  { id: "content_gen", icon: "✎", label: "Content",    desc: "Writing 2000+ words with FAQ" },
+  { id: "images",      icon: "⬡", label: "Images",     desc: "Fetching & embedding 4–5 photos" },
   { id: "publishing",  icon: "↑", label: "Scheduling", desc: "Pushing to WordPress" },
 ];
 
@@ -124,26 +128,6 @@ const buildSchedule = (startDate, time, count = 10) => {
     d.setHours(h, m, 0, 0);
     return d.toISOString().slice(0, 19);
   });
-};
-
-// Insert images into HTML at h2 section boundaries
-const insertImagesIntoContent = (html, images) => {
-  if (!images.length) return html;
-  const parts = html.split(/<\/h2>/i);
-  if (parts.length < 3) return html;
-  const insertAt = new Set();
-  const slots = parts.length - 2;
-  const step = Math.max(1, Math.floor(slots / images.length));
-  for (let i = 0; i < images.length; i++) insertAt.add(1 + i * step);
-  let imgIdx = 0;
-  return parts.map((part, i) => {
-    const closer = i < parts.length - 1 ? "</h2>" : "";
-    if (insertAt.has(i) && imgIdx < images.length) {
-      const img = images[imgIdx++];
-      return part + closer + `<figure style="margin:28px 0"><img src="${img.url}" alt="${img.alt}" style="width:100%;max-height:420px;object-fit:cover;border-radius:12px"/><figcaption style="text-align:center;font-size:12px;color:#888;margin-top:8px">${img.credit}</figcaption></figure>`;
-    }
-    return part + closer;
-  }).join("");
 };
 
 // ─── SMALL COMPONENTS ────────────────────────────────────────────
@@ -821,19 +805,124 @@ Respond ONLY in JSON (no markdown): {"seoTitle":"...","slug":"...","metaDescript
     return parseAIJson(text);
   };
 
+  const langLineFor = (lang) => lang !== "en"
+    ? `\nCRITICAL: Write the ENTIRE article in ${LANG_NAMES[lang] || lang} — all headings, paragraphs, FAQ and CTA must be in ${LANG_NAMES[lang] || lang}.`
+    : "";
+
+  // The heading text insertFaq/hasFaqSection look for, in the article's language
+  const FAQ_TITLE = { en:"Frequently Asked Questions", it:"Domande Frequenti (FAQ)", de:"Häufig gestellte Fragen (FAQ)", fr:"Questions Fréquentes (FAQ)", es:"Preguntas Frecuentes (FAQ)" };
+
   const generateContent = async (topic, lang = "en", profile = DEFAULT_PROFILE) => {
-    const kws = pickRandomKeywords(profile.keywords, 3);
+    const kws = pickRandomKeywords(profile.keywords, 4);
     const kwSection = kws.length
-      ? `\nService keywords to naturally include 1-2 times each (do NOT stuff — weave them in naturally as anchor text or in context): ${kws.map(k => `"${k}"`).join(", ")}`
+      ? `\nTarget keywords — use each 2-3 times woven naturally into sentences, and wrap the most important occurrence of each in <strong>: ${kws.map(k => `"${k}"`).join(", ")}`
       : "";
-    const langLine = lang !== "en" ? `\nCRITICAL: Write the ENTIRE article in ${LANG_NAMES[lang] || lang} — all headings, paragraphs, FAQ, and CTA must be in ${LANG_NAMES[lang] || lang}.` : "";
+    const faqTitle = FAQ_TITLE[lang] || FAQ_TITLE.en;
     const text = await aiCall(`You are a professional blog writer for "${profile.name}" (${profile.website}), a premium business in this niche: ${profile.niche}.
-Write a comprehensive SEO-optimized blog article.
+Write a comprehensive, genuinely useful SEO-optimized blog article.
 Title: "${topic.seoTitle || topic.title}" | Keywords: ${topic.keywords} | Category: ${topic.category}
-Requirements: 2000+ words, HTML (h2,h3,p,ul,li,strong,em), 5-7 H2 sections, practical tips and costs, FAQ section at end (6-8 questions)${profile.name ? `, CTA mentioning ${profile.name}` : ""}.${kwSection}${brandRules(profile)}${langLine}
-Also generate 5 image search queries IN ENGLISH suitable for stock photography of: ${profile.niche}.
+
+HARD REQUIREMENTS:
+1. LENGTH: at least 2000 words of real body copy — aim for 2200-2500. This is the single most important requirement; short articles are rejected. Write in depth: specifics, numbers, prices, durations, place names, seasons, step-by-step detail. Never pad with filler or repeat yourself.
+2. STRUCTURE: valid HTML using only h2, h3, p, ul, ol, li, strong, em, table, tr, td. No <html>, <head>, <body> or markdown fences. Start with a 2-3 paragraph intro (no h2 above it), then 6-8 <h2> sections of 250-350 words each, several with <h3> sub-points.
+3. EMPHASIS: bold the key phrases, statistics and keywords with <strong> — roughly 10-15 times across the article. Never bold whole paragraphs.
+4. Include one "Key Takeaways" <ul> near the top and at least one comparison <table> (e.g. costs, seasons or options).
+5. FAQ: end the article with <h2>${faqTitle}</h2> followed by 6-8 questions. Each question must be an <h3> and each answer a <p> of 40-70 words that directly answers it.${profile.name ? `\n6. Close with a short call-to-action paragraph mentioning ${profile.name}.` : ""}${kwSection}${brandRules(profile)}${langLineFor(lang)}
+
+Also generate 5 image search queries IN ENGLISH suitable for stock photography of: ${profile.niche}. Make them concrete and visual (place, subject, activity) — not abstract.
 Respond ONLY in JSON (no markdown): {"content":"<full HTML>","imageQueries":["q1","q2","q3","q4","q5"],"wordCount":2200}`);
     return parseAIJson(text);
+  };
+
+  // Grok routinely lands under target. Rather than accept a thin article we ask
+  // for extra sections only — cheaper and safer than regenerating the whole thing.
+  const expandContent = async (html, topic, lang, profile, shortfall) => {
+    const existing = [...String(html).matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/gi)].map(m => m[1].replace(/<[^>]*>/g, "").trim());
+    const text = await aiCall(`You are expanding an existing blog article titled "${topic.seoTitle || topic.title}" for a business in this niche: ${profile.niche}.
+It is about ${shortfall} words short of the required length.
+
+Write 2-3 ADDITIONAL <h2> sections totalling at least ${Math.max(400, shortfall + 150)} words that add genuinely new information.
+These H2 sections already exist — do NOT repeat or rephrase them: ${existing.map(h => `"${h}"`).join(", ") || "(none)"}.
+Use the same voice. Same HTML rules: h2, h3, p, ul, li, strong, em only. Bold key phrases with <strong>. Do not write an intro, a conclusion or an FAQ — sections only.${brandRules(profile)}${langLineFor(lang)}
+Respond ONLY in JSON (no markdown): {"content":"<h2>…</h2>…"}`);
+    const parsed = parseAIJson(text);
+    return String(parsed.content || parsed.html || "").trim();
+  };
+
+  const generateFaqSection = async (topic, lang, profile) => {
+    const faqTitle = FAQ_TITLE[lang] || FAQ_TITLE.en;
+    const text = await aiCall(`Write an FAQ section for a blog article titled "${topic.seoTitle || topic.title}" (niche: ${profile.niche}, keywords: ${topic.keywords}).
+Exactly 7 questions real readers would search for. Each question is an <h3>, each answer a <p> of 40-70 words that answers it directly and specifically.
+Start the block with <h2>${faqTitle}</h2>. HTML only, no markdown.${brandRules(profile)}${langLineFor(lang)}
+Respond ONLY in JSON (no markdown): {"faq":"<h2>${faqTitle}</h2><h3>…</h3><p>…</p>…"}`);
+    const parsed = parseAIJson(text);
+    return String(parsed.faq || parsed.content || "").trim();
+  };
+
+  /**
+   * Everything between "Grok returned HTML" and "this is publishable":
+   * brand guard → length top-up → FAQ → bolded keywords → images → FAQ schema.
+   * Shared by the pipeline and the single test article so they cannot drift.
+   */
+  const polishArticle = async ({ raw, topic, lang, profile, images, logFn }) => {
+    const log = logFn || (() => {});
+
+    // Last line of defence: rewrite any competitor brand Grok let through
+    const guarded = enforceBrand(raw, profile, profile.forbidden);
+    if (guarded.replaced) log(`  🛡 Rewrote ${guarded.replaced} stray brand mention(s): ${guarded.terms.join(", ")}`, "warn");
+    let html = guarded.html;
+
+    // Length
+    let words = countWords(html);
+    if (words < MIN_WORDS) {
+      const shortfall = MIN_WORDS - words;
+      log(`  ↻ ${words} words — expanding by ~${shortfall} to reach ${MIN_WORDS}…`, "warn");
+      try {
+        const extra = await expandContent(html, topic, lang, profile, shortfall);
+        if (extra) {
+          const safeExtra = enforceBrand(extra, profile, profile.forbidden).html;
+          html = insertBeforeFaq(html, safeExtra);
+          words = countWords(html);
+        }
+      } catch (err) {
+        log(`  ⚠ Expansion failed (${err.message}) — keeping the shorter draft`, "warn");
+      }
+    }
+    if (words < MIN_WORDS) log(`  ⚠ ${words} words — still under the ${MIN_WORDS} target`, "warn");
+    else log(`  ✓ ${words} words`, "success");
+
+    // FAQ
+    if (!hasFaqSection(html)) {
+      log("  ↻ No FAQ section — generating one…", "warn");
+      try {
+        const faq = await generateFaqSection(topic, lang, profile);
+        if (faq) html += "\n" + enforceBrand(faq, profile, profile.forbidden).html;
+      } catch (err) {
+        log(`  ⚠ FAQ generation failed: ${err.message}`, "warn");
+      }
+    }
+    const faqPairs = extractFaqPairs(html);
+    log(faqPairs.length ? `  ✓ FAQ: ${faqPairs.length} Q&A` : "  ⚠ No FAQ in the final article", faqPairs.length ? "success" : "warn");
+
+    // Keyword emphasis — the model bolds some already; this guarantees the rest
+    const kwList = [...new Set([
+      ...String(topic.keywords || "").split(",").map(k => k.trim()),
+      ...(profile.keywords || []),
+    ].filter(Boolean))];
+    const bolded = boldKeywords(html, kwList, { perKeyword: 2 });
+    html = bolded.html;
+    if (bolded.bolded) log(`  ✓ Bolded ${bolded.bolded} keyword mention(s)`, "success");
+
+    // Images
+    const placed = insertImages(html, images);
+    html = placed.html;
+    if (placed.inserted) log(`  ✓ ${placed.inserted} image(s) embedded in the article`, "success");
+    else log("  ⚠ No images embedded — check the Unsplash keys in Settings", "error");
+
+    // FAQPage rich-result markup
+    html += buildFaqSchema(faqPairs);
+
+    return { html, words, faq: faqPairs.length, images: placed.inserted, report: seoReport(html, kwList) };
   };
 
   // Every title this client has ever been given, so Grok can avoid repeats
@@ -1090,17 +1179,13 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
       addTL("  Writing 2000+ word article…");
       const art = { ...topic, seoTitle: td.seoTitle, slug: td.slug, metaDesc: td.metaDescription };
       const cd = await generateContent(art, "en", profile);
-      addTL(`  ✓ Content: ~${cd.wordCount} words`, "success");
-
-      const guarded = enforceBrand(cd.content, profile, profile.forbidden);
-      if (guarded.replaced) addTL(`  🛡 Rewrote ${guarded.replaced} stray brand mention(s): ${guarded.terms.join(", ")}`, "warn");
 
       addTL("  Fetching Unsplash images (4–5)…");
       const imgs = await fetchImages(cd.imageQueries || [], addTL, topic.category, profile.niche);
-      addTL(`  ✓ ${imgs.length} images fetched`, "success");
+      addTL(imgs.length ? `  ✓ ${imgs.length} images fetched` : "  ✕ 0 images fetched — add an Unsplash key in Settings", imgs.length ? "success" : "error");
 
-      const finalContent = insertImagesIntoContent(guarded.html, imgs);
-      setTestResult({ seoTitle: td.seoTitle, slug: td.slug, metaDesc: td.metaDescription, content: finalContent, images: imgs, wordCount: cd.wordCount, category: topic.category, keywords: topic.keywords });
+      const polished = await polishArticle({ raw: cd.content, topic: art, lang: "en", profile, images: imgs, logFn: addTL });
+      setTestResult({ seoTitle: td.seoTitle, slug: td.slug, metaDesc: td.metaDescription, content: polished.html, images: imgs, wordCount: polished.words, category: topic.category, keywords: topic.keywords, report: polished.report });
       addTL("Done! Article ready to preview.", "success");
     } catch (err) {
       addTL(`Error: ${err.message}`, "error");
@@ -1153,17 +1238,16 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
         addLog("  Writing 2000+ word article…");
         const freshA = (monthsRef.current[monthKey] || months[monthKey])?.articles.find(x => x.id===a.id) || a;
         const cd = await generateContent(freshA, lang, profile);
-        addLog(`  ✓ ~${cd.wordCount||2000} words written`, "success");
-
-        // Last line of defence: rewrite any competitor brand Grok let through
-        const guarded = enforceBrand(cd.content, profile, profile.forbidden);
-        if (guarded.replaced) addLog(`  🛡 Rewrote ${guarded.replaced} stray brand mention(s): ${guarded.terms.join(", ")}`, "warn");
 
         updateArticle(monthKey, a.id, { status:"images" });
         const imgs = await fetchImages(cd.imageQueries||[], (msg, type) => addLog(msg, type), a.category, profile.niche);
-        const contentWithImgs = insertImagesIntoContent(guarded.html, imgs);
-        updateArticle(monthKey, a.id, { content:contentWithImgs, wordCount:cd.wordCount||2000, images:imgs, status:"ready" });
-        addLog(`  ✓ ${imgs.length} images embedded`, "success");
+        if (!imgs.length) addLog("  ✕ 0 images fetched — add or renew an Unsplash key in Settings", "error");
+
+        const polished = await polishArticle({ raw: cd.content, topic: freshA, lang, profile, images: imgs, logFn: addLog });
+        updateArticle(monthKey, a.id, {
+          content: polished.html, wordCount: polished.words, images: imgs,
+          faqCount: polished.faq, imageCount: polished.images, status: "ready",
+        });
       } catch (err) { updateArticle(monthKey, a.id, { status:"error", error:err.message }); addLog(`  ✕ ${err.message}`, "error"); continue; }
     }
 
@@ -2124,8 +2208,9 @@ ${embeddedContent}
                           <span style={{ fontSize:10, color:cat.text, fontWeight:500 }}>{a.category}</span>
                         </span>
                         <div style={{ display:"flex", gap:8 }}>
-                          {a.images?.length > 0 && <span style={{ fontSize:10, color:"#c084fc" }}>🖼 {a.images.length}</span>}
-                          {a.wordCount > 0 && <span style={{ fontSize:10, color:C.muted2, fontFamily:"'JetBrains Mono',monospace" }}>{a.wordCount}w</span>}
+                          {(a.imageCount ?? a.images?.length ?? 0) > 0 && <span style={{ fontSize:10, color:"#c084fc" }}>🖼 {a.imageCount ?? a.images.length}</span>}
+                          {a.faqCount > 0 && <span style={{ fontSize:10, color:"#38bdf8" }}>❓{a.faqCount}</span>}
+                          {a.wordCount > 0 && <span style={{ fontSize:10, color: a.wordCount >= MIN_WORDS ? "#22c55e" : "#fbbf24", fontFamily:"'JetBrains Mono',monospace" }}>{a.wordCount}w</span>}
                         </div>
                       </div>
                       {a.scheduledAt && (
@@ -2151,8 +2236,9 @@ ${embeddedContent}
                   <h1 style={{ margin:"0 0 8px", fontSize:22, fontWeight:800, color:C.text }}>{viewArticle.seoTitle || viewArticle.title}</h1>
                   <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
                     {viewArticle.slug && <span style={{ fontSize:12, color:C.muted, fontFamily:"'JetBrains Mono',monospace" }}>/{viewArticle.slug}</span>}
-                    {viewArticle.wordCount > 0 && <span style={{ fontSize:12, color:C.muted }}>~{viewArticle.wordCount} words</span>}
-                    {viewArticle.images?.length > 0 && <span style={{ fontSize:12, color:"#c084fc" }}>🖼 {viewArticle.images.length} images</span>}
+                    {viewArticle.wordCount > 0 && <span style={{ fontSize:12, color: viewArticle.wordCount >= MIN_WORDS ? "#22c55e" : "#fbbf24" }}>{viewArticle.wordCount} words</span>}
+                    {(viewArticle.imageCount ?? viewArticle.images?.length ?? 0) > 0 && <span style={{ fontSize:12, color:"#c084fc" }}>🖼 {viewArticle.imageCount ?? viewArticle.images.length} images</span>}
+                    {viewArticle.faqCount > 0 && <span style={{ fontSize:12, color:"#38bdf8" }}>❓ {viewArticle.faqCount} FAQ</span>}
                     {viewArticle.scheduledAt && <span style={{ fontSize:12, color:"#818cf8" }}>📅 {new Date(viewArticle.scheduledAt).toLocaleString()}</span>}
                   </div>
                 </div>
@@ -2724,7 +2810,18 @@ ${embeddedContent}
                           <div style={{ fontSize:11, color:C.muted, fontFamily:"'JetBrains Mono',monospace" }}>/{testResult.slug}</div>
                         </div>
                         <div style={{ display:"flex", gap:6, flexShrink:0 }}>
-                          <span style={{ fontSize:11, color:"#22c55e", background:"rgba(34,197,94,0.1)", border:"1px solid rgba(34,197,94,0.2)", padding:"3px 10px", borderRadius:6, fontFamily:"monospace" }}>~{testResult.wordCount} words</span>
+                          {(() => {
+                            const ok = testResult.wordCount >= MIN_WORDS;
+                            const col = ok ? "#22c55e" : "#fbbf24";
+                            const chip = { fontSize:11, color:col, background:`${col}1a`, border:`1px solid ${col}33`, padding:"3px 10px", borderRadius:6, fontFamily:"monospace" };
+                            const r = testResult.report;
+                            return <>
+                              <span style={chip} title={ok ? "Meets the 2000 word target" : `Under the ${MIN_WORDS} word target`}>{testResult.wordCount} words</span>
+                              {r && <span style={{ ...chip, color:"#c084fc", background:"#c084fc1a", border:"1px solid #c084fc33" }}>🖼 {r.images}</span>}
+                              {r && <span style={{ ...chip, color:"#38bdf8", background:"#38bdf81a", border:"1px solid #38bdf833" }}>❓ {r.faq} FAQ</span>}
+                              {r && <span style={{ ...chip, color:C.muted, background:"transparent", border:`1px solid ${C.border2}` }}>{r.bold} bold</span>}
+                            </>;
+                          })()}
                           {testResult.category && (() => { const cs = CAT[testResult.category]; return cs ? <span style={{ fontSize:11, color:cs.text, background:cs.grad, padding:"3px 10px", borderRadius:6 }}>{testResult.category}</span> : null; })()}
                         </div>
                       </div>

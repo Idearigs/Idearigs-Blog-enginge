@@ -78,7 +78,7 @@ const syncArticles = async (months) => {
 };
 
 // ── Secret masking ───────────────────────────────────────────────
-const { isMasked, redactState, unmaskState } = require("./secrets");
+const { isMasked, redactState, unmaskState, unsplashKeysOf } = require("./secrets");
 
 // Resolve WordPress credentials for a request. The browser only ever holds a
 // masked password, so anything masked is looked up by site id server-side.
@@ -243,7 +243,7 @@ app.post("/api/images/search", async (req, res) => {
 
   let keys;
   try {
-    keys = ((await readState()).config?.unsplashKeys || []).filter(Boolean);
+    keys = unsplashKeysOf((await readState()).config || {});
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
