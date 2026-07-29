@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { getMonthKey, getMonthLabel, filterMonths, rollupMonths } from "./monthFilters";
+import {
+  getMonthKey, getMonthLabel, filterMonths, rollupMonths,
+  makeMonthKey, monthPeriod, migrateMonthKeys,
+} from "./monthFilters";
 import { collectForbiddenBrands, enforceBrand, normalizeDomain } from "./brandGuard";
 import {
   MIN_WORDS, countWords, hasFaqSection, extractFaqPairs, buildFaqSchema,
@@ -359,7 +362,14 @@ export default function BlogAutomationPro() {
 
   const applyState = (saved) => {
     if (!saved) return;
-    if (saved.months)        setMonths(saved.months);
+    // Bare "2026-01" keys predate multi-client months; rewrite them so a
+    // second client can own the same calendar month. Payments and article ids
+    // move with their month. The result is saved by the next autosave.
+    const migrated = migrateMonthKeys({ months: saved.months || {}, payments: saved.payments || [] }, uid);
+    const renamedCount = Object.keys(migrated.renamed).length;
+    if (renamedCount) console.info(`[months] re-keyed ${renamedCount} month(s) for multi-client support`);
+
+    if (saved.months)        setMonths(migrated.months);
     // Older records predate per-client content profiles — normalise them here
     if (saved.clients)       setClients(saved.clients.map(c => ({
       ...c,
@@ -382,7 +392,7 @@ export default function BlogAutomationPro() {
         niche: sc.niche || "Sri Lanka tours and travel",
       };
     });
-    if (saved.payments)      setPayments(saved.payments);
+    if (saved.payments)      setPayments(migrated.payments);
     if (saved.targetKeywords) setTargetKeywords(saved.targetKeywords);
   };
 
@@ -601,14 +611,18 @@ export default function BlogAutomationPro() {
     return c?.topics?.length ? c.topics : TOPIC_BANK;
   };
 
+  // The key a month for this client+period would occupy. Several clients can
+  // share a period; the same client twice in one period is still a duplicate.
+  const monthKeyFor = (period, clientId) => makeMonthKey(period, clientId || `none-${uid()}`);
+
   const createMonth = async () => {
     if (nmGenerating) return;
     setNmError("");
-    // Months are keyed by calendar month, so a second client cannot share one.
-    // Say so instead of leaving the button looking broken.
-    if (months[nmDate]) {
-      const owner = getClient(months[nmDate].clientId)?.name;
-      setNmError(`${getMonthLabel(nmDate)} already exists${owner ? ` for ${owner}` : ""}. Pick a different month.`);
+
+    const monthKey = monthKeyFor(nmDate, nmClientId);
+    if (months[monthKey]) {
+      const owner = getClient(nmClientId)?.name;
+      setNmError(`${owner || "This client"} already has ${getMonthLabel(nmDate)}. Open it from the Months page, or pick another month.`);
       return;
     }
 
@@ -632,21 +646,23 @@ export default function BlogAutomationPro() {
     if (!picked?.length) { setNmError("No topics available for this month."); return; }
     const schedule = buildSchedule(nmStartDate, nmTime, picked.length);
     const articles = picked.map((t, i) => ({
-      id: `${nmDate}-${i}`, ...t,
+      // Article ids are the primary key of the articles table, so they carry
+      // the full month key — two clients' Januaries must not collide.
+      id: `${monthKey}-${i}`, ...t,
       seoTitle:"", content:"", metaDesc:"", slug:"",
       images:[], status:"pending", wordCount:0, error:null,
       scheduledAt: schedule[i],
     }));
-    setMonths(p => ({ ...p, [nmDate]: {
+    setMonths(p => ({ ...p, [monthKey]: {
       articles, createdAt: new Date().toISOString(),
       clientId: nmClientId, siteId: nmSiteId,
       scheduleStartDate: nmStartDate, scheduleTime: nmTime,
       language: nmLanguage,
     }}));
     const price = clients.find(c => c.id===nmClientId)?.pricePerMonth ?? config.pricePerMonth;
-    setPayments(p => [...p, { monthKey:nmDate, status:"unpaid", amount:price, paidAt:null, clientId:nmClientId }]);
+    setPayments(p => [...p, { monthKey, status:"unpaid", amount:price, paidAt:null, clientId:nmClientId }]);
     setShowNewMonth(false);
-    setSelectedMonth(nmDate);
+    setSelectedMonth(monthKey);
     setNav("month");
   };
 
@@ -693,10 +709,12 @@ export default function BlogAutomationPro() {
     reader.onload = (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data.months)   setMonths(data.months);
+        // A backup taken before multi-client months carries bare period keys
+        const m = migrateMonthKeys({ months: data.months || {}, payments: data.payments || [] }, uid);
+        if (data.months)   setMonths(m.months);
         if (data.clients)  setClients(data.clients);
         if (data.sites)    setSites(data.sites);
-        if (data.payments) setPayments(data.payments);
+        if (data.payments) setPayments(m.payments);
         if (data.config)   setConfig(p => ({ ...p, ...data.config }));
         if (Array.isArray(data.targetKeywords)) setTargetKeywords(data.targetKeywords);
         alert(
@@ -1336,7 +1354,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${slugifyName(getClient(monthData.clientId)?.name) || "articles"}-${monthKey}.json`;
+      a.download = `${slugifyName(getClient(monthData.clientId)?.name) || "articles"}-${monthPeriod(monthKey)}.json`;
       a.click();
       URL.revokeObjectURL(url);
       addLog("💾 Articles auto-saved to Downloads folder.", "success");
@@ -1344,7 +1362,9 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
   };
 
   const deleteMonth = (monthKey) => {
-    if (!confirm(`Delete ${getMonthLabel(monthKey)} and all its articles? This cannot be undone.`)) return;
+    // Two clients can share a calendar month, so name the owner in the prompt
+    const owner = getClient(months[monthKey]?.clientId)?.name;
+    if (!confirm(`Delete ${getMonthLabel(monthKey)}${owner ? ` for ${owner}` : ""} and all its articles? This cannot be undone.`)) return;
     setMonths(p => { const n = { ...p }; delete n[monthKey]; return n; });
     setPayments(p => p.filter(x => x.monthKey !== monthKey));
     if (selectedMonth === monthKey) { setSelectedMonth(null); setNav("dashboard"); }
@@ -1561,7 +1581,15 @@ ${embeddedContent}
   const nmBank = topicBankFor(nmClientId);
   const nmCount = nmTopicSource === "ai" ? 10 : Math.min(10, nmBank.length);
   const nmUsesClientTopics = !!clients.find(c => c.id === nmClientId)?.topics?.length;
-  const sortedMonths = Object.keys(months).sort().reverse();
+  // Only a repeat for the SAME client is a duplicate — other clients may share
+  // the period, and an unassigned month gets a fresh key every time.
+  const nmDuplicate = !!nmClientId && !!months[makeMonthKey(nmDate, nmClientId)];
+  const nmPeriodOwners = Object.keys(months)
+    .filter(k => monthPeriod(k) === monthPeriod(nmDate))
+    .map(k => getClient(months[k].clientId)?.name)
+    .filter(Boolean);
+  // Newest period first; clients sharing a period are grouped by name
+  const sortedMonths = filterMonths({ months, payments, clients, sites, sort: "newest" });
   const totalRevenue = payments.filter(p => p.status==="paid").reduce((s,p) => s+(p.amount||0), 0);
   const totalArticles = Object.values(months).reduce((s,m) => s+m.articles.filter(a => DONE_STATUSES.includes(a.status)).length, 0);
   const viewArticle = selectedMonth && selectedArticle ? months[selectedMonth]?.articles.find(a => a.id===selectedArticle) : null;
@@ -2940,8 +2968,17 @@ ${embeddedContent}
                 { value:"fr", label:"🇫🇷 French" },
                 { value:"es", label:"🇪🇸 Spanish" },
               ]} />
-            <Select label="Client" value={nmClientId} onChange={v => { setNmClientId(v); setNmSiteId(""); }}
+            <Select label="Client" value={nmClientId} onChange={v => { setNmClientId(v); setNmSiteId(""); setNmError(""); }}
               options={[{ value:"", label:"— No client —" }, ...clients.map(c => ({ value:c.id, label:c.name }))]} />
+
+            {/* Several clients can share a calendar month; the same client twice cannot */}
+            {nmPeriodOwners.length > 0 && (
+              <div style={{ marginTop:-8, marginBottom:16, fontSize:11, color: nmDuplicate ? "#fca5a5" : C.muted, lineHeight:1.6 }}>
+                {nmDuplicate
+                  ? `${getClient(nmClientId)?.name} already has ${getMonthLabel(nmDate)} — open it from the Months page instead.`
+                  : `${getMonthLabel(nmDate)} already exists for ${nmPeriodOwners.join(", ")}. Creating another for a different client is fine.`}
+              </div>
+            )}
 
             {/* Topic source */}
             <div style={{ marginBottom:16 }}>
@@ -2994,8 +3031,8 @@ ${embeddedContent}
 
             <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
               <Btn onClick={() => setShowNewMonth(false)} variant="ghost" disabled={nmGenerating}>Cancel</Btn>
-              <Btn onClick={createMonth} disabled={!!months[nmDate] || nmGenerating}>
-                {months[nmDate] ? "Month exists" : nmGenerating ? "⏳ Generating topics…" : "Create Month"}
+              <Btn onClick={createMonth} disabled={nmDuplicate || nmGenerating}>
+                {nmDuplicate ? "Already created" : nmGenerating ? "⏳ Generating topics…" : "Create Month"}
               </Btn>
             </div>
           </div>
