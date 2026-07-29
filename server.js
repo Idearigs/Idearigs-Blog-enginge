@@ -52,10 +52,19 @@ const readState = async () => {
   return rows[0]?.value || {};
 };
 
+// Every state save used to rewrite every article row — 100+ statements each
+// time a Settings field was typed in. Track what was last written and skip
+// rows that have not changed. Empty after a restart, so the first save still
+// writes everything.
+const articleHashes = new Map();
+const hashOf = (o) => crypto.createHash("sha1").update(JSON.stringify(o)).digest("hex");
+
 const syncArticles = async (months) => {
   if (!months) return;
   for (const [monthKey, monthData] of Object.entries(months)) {
     for (const a of (monthData.articles || [])) {
+      const h = hashOf([monthKey, a]);
+      if (articleHashes.get(a.id) === h) continue;
       await pool.query(`
         INSERT INTO articles
           (id, month_key, title, seo_title, slug, category, keywords, meta_desc,
@@ -73,8 +82,12 @@ const syncArticles = async (months) => {
         a.images ? JSON.stringify(a.images) : null,
         a.error||null,
       ]);
+      articleHashes.set(a.id, h);
     }
   }
+  // Drop rows for months the user deleted, so the table does not grow forever
+  const keys = Object.keys(months);
+  if (keys.length) await pool.query("DELETE FROM articles WHERE month_key <> ALL($1::text[])", [keys]);
 };
 
 // ── Secret masking ───────────────────────────────────────────────
@@ -167,9 +180,23 @@ app.get("/api/state", async (req, res) => {
   }
 });
 
+// Belt-and-braces against a client that lost its data and saves blanks over
+// everything. A user deleting records one at a time never empties all four
+// collections in a single write, so this only ever catches the failure case.
+const wouldWipeEverything = (incoming, stored) => {
+  const size = (s) => Object.keys(s.months || {}).length + (s.clients || []).length
+    + (s.sites || []).length + (s.payments || []).length;
+  return size(stored) > 0 && size(incoming) === 0;
+};
+
 app.post("/api/state", async (req, res) => {
   try {
-    const merged = unmaskState(req.body || {}, await readState());
+    const stored = await readState();
+    if (wouldWipeEverything(req.body || {}, stored)) {
+      console.warn("[DB] refused a save that would have emptied every collection");
+      return res.status(409).json({ error: "Refused: this save would erase all stored data. Reload the page and try again." });
+    }
+    const merged = unmaskState(req.body || {}, stored);
     await pool.query(`
       INSERT INTO app_state (key, value, updated_at) VALUES ('main', $1, NOW())
       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
@@ -304,6 +331,27 @@ app.post("/api/images/search", async (req, res) => {
 });
 
 // ── WordPress Proxy (avoids browser CORS) ───────────────────────
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+// The image URL is fetched by this server, so an arbitrary value would let a
+// logged-in user reach anything the container can reach — cloud metadata,
+// internal admin panels — and push the response into their WordPress media
+// library. Only public http(s) hosts are allowed.
+const PRIVATE_HOST = /^(localhost|.*\.local|.*\.internal|\[?::1\]?|10\.\d+\.\d+\.\d+|127\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|0\.0\.0\.0)$/i;
+
+const isFetchableImageUrl = (raw) => {
+  let u;
+  try { u = new URL(String(raw)); } catch { return false; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  return !PRIVATE_HOST.test(u.hostname);
+};
+
+// Quotes and newlines here would break out of the Content-Disposition header
+const safeFilename = (name) => {
+  const clean = String(name || "").replace(/[^A-Za-z0-9._-]/g, "-").replace(/^[-.]+/, "").slice(0, 120);
+  return clean || "featured-image.jpg";
+};
+
 app.post("/api/wp/test", async (req, res) => {
   const { url, user, appPass } = await resolveCreds(req.body);
   if (!url || !user || !appPass) return res.status(400).json({ error: "url, user, appPass required" });
@@ -345,15 +393,18 @@ app.post("/api/wp/upload-image", async (req, res) => {
   const { url, user, appPass } = await resolveCreds(req.body);
   const { imageUrl, filename, alt } = req.body;
   if (!url || !user || !appPass || !imageUrl) return res.status(400).json({ error: "url, user, appPass, imageUrl required" });
+  if (!isFetchableImageUrl(imageUrl)) return res.status(400).json({ error: "imageUrl must be a public http(s) URL" });
   try {
     const base = url.replace(/\/$/, "");
     const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");
     // Fetch image bytes from Unsplash with a 15s timeout
-    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(15000) });
+    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(15000), redirect: "follow" });
     if (!imgRes.ok) return res.status(502).json({ error: `Could not fetch image: ${imgRes.status}` });
-    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
     const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-    const fname = filename || "featured-image.jpg";
+    if (!/^image\//i.test(contentType)) return res.status(400).json({ error: `Not an image (${contentType})` });
+    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+    if (imgBuffer.length > MAX_IMAGE_BYTES) return res.status(413).json({ error: "Image larger than 20 MB" });
+    const fname = safeFilename(filename);
     // Upload to WP media library with a 30s timeout
     const uploadRes = await fetch(`${base}/wp-json/wp/v2/media`, {
       method: "POST",
@@ -408,6 +459,8 @@ app.post("/api/wp/find-post", async (req, res) => {
 app.post("/api/wp/category", async (req, res) => {
   const { url, user, appPass } = await resolveCreds(req.body);
   const { name } = req.body;
+  if (!url || !user || !appPass) return res.status(400).json({ error: "url, user, appPass required" });
+  if (!name || !String(name).trim()) return res.status(400).json({ error: "name required" });
   try {
     const base = url.replace(/\/$/, "");
     const auth = "Basic " + Buffer.from(`${user}:${appPass.replace(/\s+/g, "")}`).toString("base64");

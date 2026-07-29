@@ -5,22 +5,26 @@ import {
   MIN_WORDS, countWords, hasFaqSection, extractFaqPairs, buildFaqSchema,
   insertBeforeFaq, boldKeywords, insertImages, seoReport,
 } from "./articleQuality";
+import { buildSchedule, parseSchedule, toGmtStamp, slugifyName } from "./schedule";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
 let _appKey = (() => { try { return sessionStorage.getItem("blog_app_key") || ""; } catch { return ""; } })();
 const setAppKey = (k) => { _appKey = k; try { sessionStorage.setItem("blog_app_key", k); } catch {} };
 const authHeader = () => _appKey ? { "x-app-key": _appKey } : {};
 
+// Returns { locked } | { error } | { state } — never a bare null. The caller
+// MUST distinguish "the database is empty" (safe to start saving) from "the
+// load failed" (saving would overwrite real data with this session's blanks).
 const loadState = async () => {
   try {
     const res = await fetch("/api/state", { headers: authHeader() });
-    if (res.status === 401) return { __locked: true };
-    if (res.ok) {
-      const d = await res.json();
-      if (d && Object.keys(d).length > 0) return d;
-    }
-  } catch {}
-  return null;
+    if (res.status === 401) return { locked: true };
+    if (!res.ok) return { error: `Server returned ${res.status}` };
+    const d = await res.json();
+    return { state: d && Object.keys(d).length > 0 ? d : null };
+  } catch (e) {
+    return { error: e.message || "Could not reach the server" };
+  }
 };
 
 // Debounced — state changes on every keystroke, and each save rewrites the
@@ -118,17 +122,6 @@ const C = {
   text: "#e2e8f0", muted: "#64748b", muted2: "#475569",
 };
 
-// ─── SCHEDULE: 1 article per day, skip a day between each ────────
-// Article 1 → startDate, Article 2 → startDate+2, Article 3 → startDate+4 …
-const buildSchedule = (startDate, time, count = 10) => {
-  const [h, m] = (time || "09:00").split(":").map(Number);
-  return Array.from({ length: count }, (_, i) => {
-    const d = new Date(startDate + "T00:00:00");
-    d.setDate(d.getDate() + i * 2); // every other day
-    d.setHours(h, m, 0, 0);
-    return d.toISOString().slice(0, 19);
-  });
-};
 
 // ─── SMALL COMPONENTS ────────────────────────────────────────────
 const StatusDot = ({ status }) => {
@@ -270,6 +263,8 @@ export default function BlogAutomationPro() {
   const [loginPass, setLoginPass] = useState("");
   const [loginError, setLoginError] = useState("");
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [canSave, setCanSave] = useState(false);
   const [nav, setNav] = useState("dashboard");
   const [months, setMonths] = useState({});
   const monthsRef = useRef({});
@@ -391,13 +386,21 @@ export default function BlogAutomationPro() {
     if (saved.targetKeywords) setTargetKeywords(saved.targetKeywords);
   };
 
-  useEffect(() => {
-    loadState().then(saved => {
-      if (saved?.__locked) { setLocked(true); setLoaded(true); return; }
-      applyState(saved);
-      setLoaded(true);
-    });
-  }, []);
+  // Autosave stays off until we know what is already in the database. Turning it
+  // on after a failed load would push this session's empty defaults over every
+  // saved month, client, site and API key.
+  const enterApp = (res) => {
+    if (res.locked) { setLocked(true); setLoaded(true); return; }
+    if (res.error) { setLoadError(res.error); setCanSave(false); setLoaded(true); return; }
+    applyState(res.state);
+    setLoadError("");
+    setCanSave(true);
+    setLoaded(true);
+  };
+
+  const retryLoad = () => { setLoadError(""); loadState().then(enterApp); };
+
+  useEffect(() => { loadState().then(enterApp); }, []);
 
   const doLogin = async () => {
     setLoginError("");
@@ -410,32 +413,39 @@ export default function BlogAutomationPro() {
       if (!res.ok) { setLoginError("Wrong password. Try again."); return; }
       setAppKey(loginPass);
       setLocked(false);
-      loadState().then(saved => { applyState(saved); setLoaded(true); });
+      loadState().then(enterApp);
     } catch {
       setLoginError("Connection error. Is the server running?");
     }
   };
 
-  useEffect(() => { if (loaded) saveState({ months, clients, sites, config, payments, targetKeywords }); }, [months, clients, sites, config, payments, targetKeywords, loaded]);
+  useEffect(() => { if (canSave) saveState({ months, clients, sites, config, payments, targetKeywords }); }, [months, clients, sites, config, payments, targetKeywords, canSave]);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior:"smooth" }); }, [logs]);
   // Keep the ref in step with state so long-running loops read fresh articles
   useEffect(() => { monthsRef.current = months; }, [months]);
 
   const saveSettings = async () => {
+    if (!canSave) { setSettingsSavedMsg("✕ Not saved — the database never loaded. Reload first."); return; }
     setSettingsSaving(true);
     setSettingsSavedMsg("");
     try {
-      await fetch("/api/state", {
+      const res = await fetch("/api/state", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeader() },
         body: JSON.stringify({ months, clients, sites, config, payments, targetKeywords }),
       });
+      // fetch only rejects on network failure — a 500 still resolves, and
+      // reporting that as saved is how an API key silently fails to persist
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Server returned ${res.status}`);
+      }
       setSettingsSavedMsg("✓ Saved to database");
-    } catch {
-      setSettingsSavedMsg("✕ Save failed — check connection");
+    } catch (e) {
+      setSettingsSavedMsg(`✕ Save failed — ${e.message}`);
     }
     setSettingsSaving(false);
-    setTimeout(() => setSettingsSavedMsg(""), 3000);
+    setTimeout(() => setSettingsSavedMsg(""), 5000);
   };
 
   const addLog = useCallback((msg, type="info") => {
@@ -592,8 +602,15 @@ export default function BlogAutomationPro() {
   };
 
   const createMonth = async () => {
-    if (months[nmDate] || nmGenerating) return;
+    if (nmGenerating) return;
     setNmError("");
+    // Months are keyed by calendar month, so a second client cannot share one.
+    // Say so instead of leaving the button looking broken.
+    if (months[nmDate]) {
+      const owner = getClient(months[nmDate].clientId)?.name;
+      setNmError(`${getMonthLabel(nmDate)} already exists${owner ? ` for ${owner}` : ""}. Pick a different month.`);
+      return;
+    }
 
     let picked;
     if (nmTopicSource === "ai") {
@@ -658,7 +675,8 @@ export default function BlogAutomationPro() {
   const markPaid = (k) => setPaymentStatus(k, "paid");
 
   const exportData = () => {
-    const data = { months, clients, sites, payments, config, exportedAt: new Date().toISOString(), version: "wol-blog-automation-v3" };
+    // targetKeywords was missing here, so a restore silently wiped the global list
+    const data = { months, clients, sites, payments, config, targetKeywords, exportedAt: new Date().toISOString(), version: "blog-engine-v3" };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type:"application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -680,7 +698,13 @@ export default function BlogAutomationPro() {
         if (data.sites)    setSites(data.sites);
         if (data.payments) setPayments(data.payments);
         if (data.config)   setConfig(p => ({ ...p, ...data.config }));
-        alert("Data restored successfully.");
+        if (Array.isArray(data.targetKeywords)) setTargetKeywords(data.targetKeywords);
+        alert(
+          "Data restored successfully." +
+          (data.config && isMasked(data.config.grokKey)
+            ? "\n\nNote: API keys are masked in backups — re-enter them in Settings."
+            : "")
+        );
       } catch { alert("Invalid backup file."); }
     };
     reader.readAsText(file);
@@ -1057,7 +1081,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
   const publishToWP = async (site, article, logFn) => {
     const scheduledAt = article.scheduledAt;
     const now = new Date();
-    const pubDate = scheduledAt ? new Date(scheduledAt) : null;
+    const pubDate = parseSchedule(scheduledAt);
     const isFuture = pubDate && pubDate > now;
 
     // Check if post already exists with this slug to prevent duplicates on retry
@@ -1129,7 +1153,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
       ...(featuredMediaId && { featured_media: featuredMediaId }),
     };
     // Use date_gmt so WordPress treats the time as UTC regardless of site timezone
-    if (isFuture) post.date_gmt = scheduledAt;
+    if (isFuture) post.date_gmt = toGmtStamp(scheduledAt);
 
     const ctrl = new AbortController();
     const tmo = setTimeout(() => ctrl.abort(), 95000);
@@ -1261,7 +1285,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
         if (a.status !== "ready") continue;
         try {
           updateArticle(monthKey, a.id, { status:"publishing" });
-          const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
+          const dt = a.scheduledAt ? parseSchedule(a.scheduledAt) : null;
           const isFuture = dt && dt > new Date();
           addLog(`  ${isFuture ? `📅 Scheduling ${dt.toLocaleDateString()} ${dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
           const result = await publishToWP(site, a, addLog);
@@ -1312,7 +1336,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `wol-articles-${monthKey}.json`;
+      a.download = `${slugifyName(getClient(monthData.clientId)?.name) || "articles"}-${monthKey}.json`;
       a.click();
       URL.revokeObjectURL(url);
       addLog("💾 Articles auto-saved to Downloads folder.", "success");
@@ -1337,7 +1361,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
     // Auto-reschedule: if any scheduled date is in the past, rebuild the schedule
     // starting from tomorrow so all articles get proper future dates in WordPress
     const now = new Date();
-    const allPast = readyArts.every(a => !a.scheduledAt || new Date(a.scheduledAt) <= now);
+    const allPast = readyArts.every(a => !a.scheduledAt || parseSchedule(a.scheduledAt) <= now);
     if (allPast) {
       addLog("⚠ All scheduled dates are in the past — rescheduling from tomorrow…", "warn");
       const [h, m] = (monthData.scheduleTime || "09:00").split(":").map(Number);
@@ -1345,8 +1369,8 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
         const d = new Date();
         d.setDate(d.getDate() + 1 + i * 2);
         d.setHours(h, m, 0, 0);
-        updateArticle(monthKey, a.id, { scheduledAt: d.toISOString().slice(0, 19) });
-        a.scheduledAt = d.toISOString().slice(0, 19);
+        updateArticle(monthKey, a.id, { scheduledAt: d.toISOString() });
+        a.scheduledAt = d.toISOString();
       });
     }
 
@@ -1356,7 +1380,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
       if (abortRef.current) break;
       try {
         updateArticle(monthKey, a.id, { status:"publishing" });
-        const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
+        const dt = a.scheduledAt ? parseSchedule(a.scheduledAt) : null;
         const isFuture = dt && dt > new Date();
         addLog(`  ${isFuture ? `📅 Scheduling for ${dt.toLocaleDateString()}` : "📤 Publishing now"}: "${a.seoTitle||a.title}"`);
         const result = await publishToWP(site, a, addLog);
@@ -1404,7 +1428,7 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
       if (!a.content && !a.seoTitle) continue;
       const num = String(i + 1).padStart(2, "0");
       const slug = a.slug || `article-${num}`;
-      const scheduledStr = a.scheduledAt ? `Scheduled: ${new Date(a.scheduledAt).toLocaleDateString()}` : "";
+      const scheduledStr = a.scheduledAt ? `Scheduled: ${parseSchedule(a.scheduledAt).toLocaleDateString()}` : "";
 
       const embeddedContent = a.content ? await embedImagesAsBase64(a.content) : "<p>No content generated yet.</p>";
 
@@ -1439,7 +1463,9 @@ ${embeddedContent}
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `WOL-Articles-${label.replace(/\s/g,"-")}.zip`;
+    // Named after the client, not the original single-brand hardcode
+    const who = slugifyName(getClient(monthData.clientId)?.name) || "articles";
+    link.download = `${who}-${label.replace(/\s/g,"-")}.zip`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -1452,6 +1478,8 @@ ${embeddedContent}
     setUploadingDocs(true);
     setUploadResults([]);
     const results = [];
+    // Hand-edited docs go through the same brand guard as generated ones
+    const profile = getProfile(monthData);
 
     for (const file of Array.from(files)) {
       // Match by filename prefix e.g. "01-slug.docx" → article index 0
@@ -1465,9 +1493,18 @@ ${embeddedContent}
       try {
         const arrayBuffer = await file.arrayBuffer();
         const result = await mammoth.convertToHtml({ arrayBuffer });
-        const html = result.value;
-        updateArticle(monthKey, article.id, { content: html, status: "ready", error: null });
-        results.push({ file: file.name, ok: true, msg: `→ Article #${idx+1}: "${article.seoTitle || article.title}"` });
+        const guarded = enforceBrand(result.value, profile, profile.forbidden);
+        const words = countWords(guarded.html);
+        updateArticle(monthKey, article.id, {
+          content: guarded.html, wordCount: words, status: "ready", error: null,
+          faqCount: extractFaqPairs(guarded.html).length,
+          imageCount: (guarded.html.match(/<img[\s>]/gi) || []).length,
+        });
+        results.push({
+          file: file.name, ok: true,
+          msg: `→ Article #${idx+1}: "${article.seoTitle || article.title}" · ${words} words`
+            + (guarded.replaced ? ` · ${guarded.replaced} brand mention(s) rewritten` : ""),
+        });
       } catch (err) {
         results.push({ file: file.name, ok: false, msg: err.message });
       }
@@ -1558,6 +1595,19 @@ ${embeddedContent}
   return (
     <div style={{ display:"flex", height:"100vh", background:C.bg, color:C.text, fontFamily:"'Inter','Segoe UI',sans-serif", overflow:"hidden" }}>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+      {/* Saving is disabled until the database has been read, so a failed load
+          cannot overwrite real data with this session's blank defaults. */}
+      {loadError && (
+        <div style={{ position:"fixed", top:0, left:0, right:0, zIndex:9999, background:"#7f1d1d", borderBottom:"1px solid #ef4444", padding:"10px 18px", display:"flex", alignItems:"center", gap:14, fontSize:13, color:"#fecaca" }}>
+          <span style={{ fontWeight:700 }}>⚠ Could not load your data — {loadError}.</span>
+          <span>Changes are <strong>not being saved</strong> so nothing already stored gets overwritten.</span>
+          <button onClick={retryLoad}
+            style={{ marginLeft:"auto", padding:"5px 14px", background:"#fecaca", border:"none", borderRadius:7, color:"#7f1d1d", fontSize:12, fontWeight:700, cursor:"pointer" }}>
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* ── SIDEBAR ── */}
       <aside style={{ width:220, background:C.surface, borderRight:`1px solid ${C.border}`, display:"flex", flexDirection:"column", flexShrink:0 }}>
@@ -1675,9 +1725,9 @@ ${embeddedContent}
                   const pct = arts.length ? Math.round(((pub+rdy)/arts.length)*100) : 0;
                   const client = getClient(months[key].clientId);
                   const site = getSite(months[key].siteId);
-                  const firstDate = arts[0]?.scheduledAt ? new Date(arts[0].scheduledAt).toLocaleDateString() : null;
+                  const firstDate = arts[0]?.scheduledAt ? parseSchedule(arts[0].scheduledAt).toLocaleDateString() : null;
                   const lastArt = arts[arts.length - 1];
-                  const lastDate = lastArt?.scheduledAt ? new Date(lastArt.scheduledAt).toLocaleDateString() : null;
+                  const lastDate = lastArt?.scheduledAt ? parseSchedule(lastArt.scheduledAt).toLocaleDateString() : null;
                   return (
                     <div key={key}
                       style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:"16px 20px", display:"flex", justifyContent:"space-between", alignItems:"center", transition:"all 0.2s" }}
@@ -1836,7 +1886,7 @@ ${embeddedContent}
                             </div>
                             <div style={{ fontSize:11, color:C.muted }}>
                               {live} live · {rdy} ready · {Math.max(0, arts.length - live - rdy)} pending · {arts.length} total
-                              {first && last && <span style={{ marginLeft:12, color:C.muted2 }}>📅 {new Date(first).toLocaleDateString()} → {new Date(last).toLocaleDateString()}</span>}
+                              {first && last && <span style={{ marginLeft:12, color:C.muted2 }}>📅 {parseSchedule(first).toLocaleDateString()} → {parseSchedule(last).toLocaleDateString()}</span>}
                             </div>
                           </div>
                           <Btn small variant="ghost" onClick={() => { setSelectedMonth(key); setNav("month"); setSelectedArticle(null); }}>Open ›</Btn>
@@ -2095,7 +2145,7 @@ ${embeddedContent}
                         🌍 {LANG_NAMES[months[selectedMonth].language]}
                       </span>
                     )}
-                    {firstDate && <span style={{ fontSize:12, color:"#818cf8", background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", padding:"2px 10px", borderRadius:6 }}>📅 {new Date(firstDate).toLocaleDateString()} – {new Date(lastDate).toLocaleDateString()}</span>}
+                    {firstDate && <span style={{ fontSize:12, color:"#818cf8", background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", padding:"2px 10px", borderRadius:6 }}>📅 {parseSchedule(firstDate).toLocaleDateString()} – {parseSchedule(lastDate).toLocaleDateString()}</span>}
                   </div>
                 </div>
                 <div style={{ display:"flex", flexDirection:"column", gap:8, alignItems:"flex-end" }}>
@@ -2165,7 +2215,7 @@ ${embeddedContent}
                   <div style={{ fontSize:11, color:C.muted, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:14 }}>📅 Publishing Schedule — 1 article every 2 days</div>
                   <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8 }}>
                     {arts.map((a, i) => {
-                      const dt = a.scheduledAt ? new Date(a.scheduledAt) : null;
+                      const dt = a.scheduledAt ? parseSchedule(a.scheduledAt) : null;
                       const isPast = dt && dt < new Date();
                       const statusColors = { published:"#14b8a6", published_now:"#38bdf8", ready:"#22c55e", error:"#f87171", pending:C.muted2 };
                       const col = statusColors[a.status] || C.muted2;
@@ -2215,7 +2265,7 @@ ${embeddedContent}
                       </div>
                       {a.scheduledAt && (
                         <div style={{ marginTop:8, fontSize:10, color:"#818cf8" }}>
-                          📅 {new Date(a.scheduledAt).toLocaleDateString()} {new Date(a.scheduledAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}
+                          📅 {parseSchedule(a.scheduledAt).toLocaleDateString()} {parseSchedule(a.scheduledAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}
                         </div>
                       )}
                     </div>
@@ -2239,7 +2289,7 @@ ${embeddedContent}
                     {viewArticle.wordCount > 0 && <span style={{ fontSize:12, color: viewArticle.wordCount >= MIN_WORDS ? "#22c55e" : "#fbbf24" }}>{viewArticle.wordCount} words</span>}
                     {(viewArticle.imageCount ?? viewArticle.images?.length ?? 0) > 0 && <span style={{ fontSize:12, color:"#c084fc" }}>🖼 {viewArticle.imageCount ?? viewArticle.images.length} images</span>}
                     {viewArticle.faqCount > 0 && <span style={{ fontSize:12, color:"#38bdf8" }}>❓ {viewArticle.faqCount} FAQ</span>}
-                    {viewArticle.scheduledAt && <span style={{ fontSize:12, color:"#818cf8" }}>📅 {new Date(viewArticle.scheduledAt).toLocaleString()}</span>}
+                    {viewArticle.scheduledAt && <span style={{ fontSize:12, color:"#818cf8" }}>📅 {parseSchedule(viewArticle.scheduledAt).toLocaleString()}</span>}
                   </div>
                 </div>
                 <StatusDot status={viewArticle.status} />
