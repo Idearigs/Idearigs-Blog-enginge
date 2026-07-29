@@ -9,6 +9,7 @@ import {
   insertBeforeFaq, boldKeywords, insertImages, seoReport,
 } from "./articleQuality";
 import { buildSchedule, parseSchedule, toGmtStamp, slugifyName } from "./schedule";
+import { createPersister, IDLE, PENDING, SAVING, ERROR } from "./persist";
 
 // ─── STORAGE ──────────────────────────────────────────────────────
 let _appKey = (() => { try { return sessionStorage.getItem("blog_app_key") || ""; } catch { return ""; } })();
@@ -31,37 +32,42 @@ const loadState = async () => {
 };
 
 // Debounced — state changes on every keystroke, and each save rewrites the
-// whole JSONB blob plus re-syncs the articles table. Any pending write is
-// flushed when the page is hidden so the debounce cannot lose an edit.
-let _saveTimer = null;
-let _pendingState = null;
+// whole JSONB blob plus re-syncs the articles table.
+const _persister = createPersister({
+  send: async (state) => {
+    const res = await fetch("/api/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeader() },
+      body: JSON.stringify(state),
+    });
+    // A 409 or 500 used to count as a successful save
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+  },
+  onStatus: (s) => { _statusListeners.forEach(fn => fn(s)); },
+});
 
-const flushState = (keepalive = false) => {
-  if (!_pendingState) return;
-  const body = JSON.stringify(_pendingState);
-  _pendingState = null;
-  clearTimeout(_saveTimer);
-  fetch("/api/state", {
-    method: "POST",
-    headers: { "Content-Type":"application/json", ...authHeader() },
-    body,
-    keepalive,
-  }).catch(() => {});
-};
-
-const saveState = (s) => {
-  _pendingState = s;
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(() => flushState(false), 800);
-};
+const _statusListeners = new Set();
+const onSaveStatus = (fn) => { _statusListeners.add(fn); return () => _statusListeners.delete(fn); };
+const saveState = (s) => _persister.save(s);
 
 if (typeof window !== "undefined") {
-  // visibilitychange fires while the page can still make a normal request;
-  // pagehide is the last resort and needs keepalive to survive unload.
+  // Write early when the tab is backgrounded, but keep the snapshot until the
+  // server confirms it. keepalive is deliberately NOT used: the browser caps
+  // keepalive bodies at 64 KB and a month of articles is far bigger, so those
+  // requests were being dropped without a trace.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushState(false);
+    if (document.visibilityState === "hidden") _persister.flush();
   });
-  window.addEventListener("pagehide", () => flushState(true));
+  window.addEventListener("pagehide", () => _persister.flush());
+  // Last line of defence: never let a reload quietly discard an edit
+  window.addEventListener("beforeunload", (e) => {
+    if (!_persister.hasUnsaved()) return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
 }
 
 // Secrets arrive from the server as "••••••••abcd" placeholders and are sent
@@ -268,6 +274,7 @@ export default function BlogAutomationPro() {
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [canSave, setCanSave] = useState(false);
+  const [saveStatus, setSaveStatus] = useState(IDLE);
   const [nav, setNav] = useState("dashboard");
   const [months, setMonths] = useState({});
   const monthsRef = useRef({});
@@ -430,6 +437,7 @@ export default function BlogAutomationPro() {
   };
 
   useEffect(() => { if (canSave) saveState({ months, clients, sites, config, payments, targetKeywords }); }, [months, clients, sites, config, payments, targetKeywords, canSave]);
+  useEffect(() => onSaveStatus(setSaveStatus), []);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior:"smooth" }); }, [logs]);
   // Keep the ref in step with state so long-running loops read fresh articles
   useEffect(() => { monthsRef.current = months; }, [months]);
@@ -1644,7 +1652,16 @@ ${embeddedContent}
             <div style={{ width:34, height:34, borderRadius:10, background:"linear-gradient(135deg,#0d9488,#14b8a6)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:15, fontWeight:800, color:"#021a17", boxShadow:"0 0 16px rgba(20,184,166,0.35)", flexShrink:0 }}>W</div>
             <div>
               <div style={{ fontSize:13, fontWeight:700, color:C.text }}>Blog Engine</div>
-              <div style={{ fontSize:10, color:C.muted, marginTop:1 }}>v3 · Wonders of Lanka</div>
+              {/* Never let a save fail invisibly again */}
+              {(() => {
+                const s = {
+                  [SAVING]:  { text: "Saving…",            color: C.muted },
+                  [PENDING]: { text: "Unsaved changes",    color: "#fbbf24" },
+                  [ERROR]:   { text: "Save failed — retrying", color: "#f87171" },
+                  [IDLE]:    { text: "All changes saved",  color: C.muted },
+                }[saveStatus] || { text: "", color: C.muted };
+                return <div style={{ fontSize:10, color:s.color, marginTop:1 }}>{s.text}</div>;
+              })()}
             </div>
           </div>
         </div>
