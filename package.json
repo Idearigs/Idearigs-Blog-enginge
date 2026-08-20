@@ -6,11 +6,13 @@
     "dev": "concurrently \"node server.js\" \"vite\"",
     "server": "node server.js",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node tests/run.mjs"
   },
   "dependencies": {
     "concurrently": "^9.2.1",
     "cors": "^2.8.6",
+    "docx": "^9.7.1",
     "express": "^5.2.1",
     "jszip": "^3.10.1",
     "mammoth": "^1.12.0",

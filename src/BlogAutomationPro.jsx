@@ -360,6 +360,10 @@ export default function BlogAutomationPro() {
   const [nmGenerating, setNmGenerating] = useState(false);
   const [nmError, setNmError] = useState("");
 
+  // Word export state — image downloads make this slow enough to need feedback
+  const [docxExporting, setDocxExporting] = useState(false);
+  const [docxProgress, setDocxProgress] = useState("");
+
   // Corrected doc upload state
   const [uploadingDocs, setUploadingDocs] = useState(false);
   const [uploadResults, setUploadResults] = useState([]);
@@ -1424,78 +1428,130 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
     setIsRunning(false);
   };
 
-  // ─── DOWNLOAD ALL AS WORD ────────────────────────────────────
-  const embedImagesAsBase64 = async (html) => {
-    const matches = [...html.matchAll(/<img([^>]*?)src="(https?:\/\/[^"]+)"([^>]*?)>/gi)];
-    let result = html;
-    for (const m of matches) {
+  // ─── DOWNLOAD ALL AS WORD (.docx) ────────────────────────────
+  // Natural pixel size, so a photo can be scaled to the text column instead of
+  // being guessed at. Returns zeroes if the browser cannot decode it.
+  const imagePixelSize = async (blob) => {
+    try {
+      if (typeof createImageBitmap === "function") {
+        const bmp = await createImageBitmap(blob);
+        const size = { width: bmp.width, height: bmp.height };
+        bmp.close?.();
+        return size;
+      }
+    } catch { /* fall through to the <img> route */ }
+    try {
+      const url = URL.createObjectURL(blob);
+      const size = await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+        img.onerror = () => resolve({ width: 0, height: 0 });
+        img.src = url;
+      });
+      URL.revokeObjectURL(url);
+      return size;
+    } catch { return { width: 0, height: 0 }; }
+  };
+
+  // The proxy first: it is not subject to CORS and already validates the URL.
+  // A direct fetch is the fallback if the proxy itself is unreachable.
+  const fetchImageBytes = async (src) => {
+    const attempts = [
+      () => fetch("/api/images/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader() },
+        body: JSON.stringify({ imageUrl: src }),
+      }),
+      () => fetch(src),
+    ];
+    for (const attempt of attempts) {
       try {
-        const res = await fetch(m[2]);
+        const res = await attempt();
         if (!res.ok) continue;
         const blob = await res.blob();
-        const b64 = await new Promise(resolve => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.readAsDataURL(blob);
-        });
-        result = result.replace(m[2], b64);
-      } catch { /* keep original URL if fetch fails */ }
+        if (!blob.size || !/^image\//i.test(blob.type || "image/jpeg")) continue;
+        const { width, height } = await imagePixelSize(blob);
+        return { data: await blob.arrayBuffer(), width, height, mime: blob.type };
+      } catch { /* try the next route */ }
     }
-    return result;
+    return null;
   };
 
   const downloadAllAsWord = async (monthKey) => {
-    const JSZip = (await import("jszip")).default;
     const monthData = months[monthKey];
-    if (!monthData) return;
-    const zip = new JSZip();
-    const label = getMonthLabel(monthKey);
+    if (!monthData || docxExporting) return;
 
-    for (let i = 0; i < monthData.articles.length; i++) {
-      const a = monthData.articles[i];
-      if (!a.content && !a.seoTitle) continue;
-      const num = String(i + 1).padStart(2, "0");
-      const slug = a.slug || `article-${num}`;
-      const scheduledStr = a.scheduledAt ? `Scheduled: ${parseSchedule(a.scheduledAt).toLocaleDateString()}` : "";
+    setDocxExporting(true);
+    setDocxProgress("Preparing…");
+    try {
+      // Loaded on demand — the docx writer is large and only this button needs it
+      const [{ default: JSZip }, blocksMod, docxMod] = await Promise.all([
+        import("jszip"), import("./htmlBlocks"), import("./docxBuilder"),
+      ]);
+      const { htmlToBlocks, imageSources } = blocksMod;
+      const { buildArticleDoc, docToBlob } = docxMod;
 
-      const embeddedContent = a.content ? await embedImagesAsBase64(a.content) : "<p>No content generated yet.</p>";
+      const zip = new JSZip();
+      const label = getMonthLabel(monthKey);
+      const clientName = getClient(monthData.clientId)?.name || "";
+      // One download per photo, even when several articles reuse it
+      const imageCache = new Map();
+      let embedded = 0, missing = 0, written = 0;
 
-      const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-<head><meta charset='utf-8'>
-<style>
-  body { font-family: Calibri, Arial, sans-serif; font-size: 12pt; line-height: 1.6; margin: 2cm; }
-  h1 { font-size: 20pt; color: #1a365d; margin-bottom: 6pt; }
-  h2 { font-size: 15pt; color: #2c5282; margin-top: 18pt; }
-  h3 { font-size: 13pt; color: #2b6cb0; }
-  .meta { background: #f7fafc; border: 1px solid #bee3f8; padding: 10pt; margin-bottom: 18pt; font-size: 10pt; }
-  .meta strong { color: #2c5282; }
-  img { max-width: 100%; }
-</style>
-</head>
-<body>
-<h1>${a.seoTitle || a.title || "Article"}</h1>
-<div class="meta">
-  <strong>Slug:</strong> ${a.slug || ""}<br>
-  <strong>Category:</strong> ${a.category || ""}<br>
-  <strong>Keywords:</strong> ${a.keywords || ""}<br>
-  <strong>Meta Description:</strong> ${a.metaDesc || ""}<br>
-  <strong>${scheduledStr}</strong>
-</div>
-${embeddedContent}
-</body></html>`;
+      const usable = monthData.articles.filter(a => a.content || a.seoTitle);
 
-      zip.file(`${num}-${slug}.doc`, "﻿" + html);
+      for (let i = 0; i < monthData.articles.length; i++) {
+        const a = monthData.articles[i];
+        if (!a.content && !a.seoTitle) continue;
+        const num = String(i + 1).padStart(2, "0");
+        setDocxProgress(`Article ${written + 1} of ${usable.length}…`);
+
+        const blocks = htmlToBlocks(a.content || "<p>No content generated yet.</p>");
+
+        for (const src of imageSources(blocks)) {
+          if (imageCache.has(src)) continue;
+          const bytes = await fetchImageBytes(src);
+          imageCache.set(src, bytes);
+          if (bytes) embedded++; else missing++;
+        }
+
+        const images = new Map([...imageCache].filter(([, v]) => v));
+        const doc = buildArticleDoc({
+          article: a,
+          blocks,
+          images,
+          meta: {
+            client: clientName,
+            scheduled: a.scheduledAt ? parseSchedule(a.scheduledAt).toLocaleString() : "",
+          },
+        });
+        zip.file(`${num}-${a.slug || `article-${num}`}.docx`, await docToBlob(doc));
+        written++;
+      }
+
+      if (!written) { setDocxProgress("Nothing to export yet."); return; }
+
+      setDocxProgress("Zipping…");
+      const blob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      // Named after the client, not the original single-brand hardcode
+      const who = slugifyName(clientName) || "articles";
+      link.download = `${who}-${label.replace(/\s/g, "-")}.zip`;
+      link.click();
+      URL.revokeObjectURL(url);
+
+      setDocxProgress(
+        `${written} .docx file(s) · ${embedded} image(s) embedded` +
+        (missing ? ` · ${missing} could not be downloaded` : "")
+      );
+    } catch (err) {
+      setDocxProgress(`Export failed: ${err.message}`);
+    } finally {
+      setDocxExporting(false);
+      setTimeout(() => setDocxProgress(""), 8000);
     }
-
-    const blob = await zip.generateAsync({ type: "blob" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    // Named after the client, not the original single-brand hardcode
-    const who = slugifyName(getClient(monthData.clientId)?.name) || "articles";
-    link.download = `${who}-${label.replace(/\s/g,"-")}.zip`;
-    link.click();
-    URL.revokeObjectURL(url);
   };
 
   // ─── UPLOAD CORRECTED DOCS ───────────────────────────────────
@@ -1964,8 +2020,8 @@ ${embeddedContent}
                           <div style={{ display:"flex", gap:6, paddingBottom:1 }}>
                             <button onClick={() => autoExportArticles(key)} title="Download articles JSON"
                               style={{ background:"rgba(56,189,248,0.08)", border:"1px solid rgba(56,189,248,0.2)", color:"#7dd3fc", borderRadius:9, padding:"9px 12px", fontSize:12, cursor:"pointer" }}>↓ JSON</button>
-                            <button onClick={() => downloadAllAsWord(key)} disabled={!arts.some(a => a.content)} title={arts.some(a => a.content) ? "Download all articles as Word (.zip)" : "No generated content yet"}
-                              style={{ background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", color: arts.some(a => a.content) ? "#a5b4fc" : C.muted2, borderRadius:9, padding:"9px 12px", fontSize:12, cursor: arts.some(a => a.content) ? "pointer" : "not-allowed" }}>📥 Word</button>
+                            <button onClick={() => downloadAllAsWord(key)} disabled={!arts.some(a => a.content) || docxExporting} title={arts.some(a => a.content) ? "Download all articles as .docx with images (.zip)" : "No generated content yet"}
+                              style={{ background:"rgba(129,140,248,0.08)", border:"1px solid rgba(129,140,248,0.2)", color: arts.some(a => a.content) ? "#a5b4fc" : C.muted2, borderRadius:9, padding:"9px 12px", fontSize:12, cursor: arts.some(a => a.content) && !docxExporting ? "pointer" : "not-allowed" }}>{docxExporting ? "⏳ Word" : "📥 Word"}</button>
                             <button onClick={() => deleteMonth(key)} title="Delete this month"
                               style={{ background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.2)", color:"#f87171", borderRadius:9, padding:"9px 12px", fontSize:12, cursor:"pointer" }}>✕ Delete</button>
                           </div>
@@ -2212,7 +2268,12 @@ ${embeddedContent}
                     {isRunning && <Btn onClick={() => { abortRef.current=true; }} variant="danger">⛔ Stop</Btn>}
                   </div>
                   {arts.some(a => a.content) && (
-                    <Btn onClick={() => downloadAllAsWord(selectedMonth)} variant="ghost">📥 Download All as Word (.zip)</Btn>
+                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                      <Btn onClick={() => downloadAllAsWord(selectedMonth)} variant="ghost" disabled={docxExporting}>
+                        {docxExporting ? "⏳ Building .docx…" : "📥 Download All as Word (.docx)"}
+                      </Btn>
+                      {docxProgress && <span style={{ fontSize:11, color:C.muted }}>{docxProgress}</span>}
+                    </div>
                   )}
                 </div>
               </div>

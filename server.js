@@ -333,6 +333,26 @@ app.post("/api/images/search", async (req, res) => {
 // ── WordPress Proxy (avoids browser CORS) ───────────────────────
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
+// Raw image bytes for the .docx export. Goes through the server so the export
+// does not depend on the photo host sending CORS headers to the browser.
+app.post("/api/images/fetch", async (req, res) => {
+  const { imageUrl } = req.body || {};
+  if (!imageUrl) return res.status(400).json({ error: "imageUrl required" });
+  if (!isFetchableImageUrl(imageUrl)) return res.status(400).json({ error: "imageUrl must be a public http(s) URL" });
+  try {
+    const r = await fetch(imageUrl, { signal: AbortSignal.timeout(20000), redirect: "follow" });
+    if (!r.ok) return res.status(502).json({ error: `Could not fetch image: ${r.status}` });
+    const type = r.headers.get("content-type") || "image/jpeg";
+    if (!/^image\//i.test(type)) return res.status(400).json({ error: `Not an image (${type})` });
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > MAX_IMAGE_BYTES) return res.status(413).json({ error: "Image larger than 20 MB" });
+    res.set("Content-Type", type).send(buf);
+  } catch (e) {
+    const msg = e.name === "TimeoutError" ? "Image download timed out" : e.message;
+    res.status(e.name === "TimeoutError" ? 504 : 500).json({ error: msg });
+  }
+});
+
 // The image URL is fetched by this server, so an arbitrary value would let a
 // logged-in user reach anything the container can reach — cloud metadata,
 // internal admin panels — and push the response into their WordPress media
