@@ -1383,12 +1383,23 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
   };
 
   // ─── PUBLISH READY (recheck) ─────────────────────────────────
+  // Anything that has been written and is not already live. Not just status
+  // "ready": after a pipeline run everything is "published", and an article
+  // whose WordPress push failed sits in "error" with perfectly good content.
+  // WordPress is checked for the slug first, so re-running skips duplicates.
+  const publishableArticles = (monthData) =>
+    (monthData?.articles || []).filter(a => a.content && !LIVE_STATUSES.includes(a.status));
+
   const publishReadyArticles = async (monthKey) => {
     const monthData = months[monthKey];
     const site = monthData?.siteId ? getSite(monthData.siteId) : null;
-    if (!site?.user || !site?.appPass) { addLog("⚠ No WordPress site linked.", "error"); return; }
-    const readyArts = monthData.articles.filter(a => a.status === "ready");
-    if (!readyArts.length) { addLog("No ready articles to publish.", "warn"); return; }
+    if (!site?.user || !site?.appPass) { addLog("⚠ No WordPress site linked — link one in Sites first.", "error"); return; }
+    const readyArts = publishableArticles(monthData);
+    if (!readyArts.length) {
+      const live = (monthData?.articles || []).filter(a => LIVE_STATUSES.includes(a.status)).length;
+      addLog(live ? `All ${live} article(s) are already in WordPress.` : "No generated articles to publish yet — run the pipeline first.", "warn");
+      return;
+    }
 
     // Auto-reschedule: if any scheduled date is in the past, rebuild the schedule
     // starting from tomorrow so all articles get proper future dates in WordPress
@@ -1564,29 +1575,60 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
     const results = [];
     // Hand-edited docs go through the same brand guard as generated ones
     const profile = getProfile(monthData);
+    const total = monthData.articles.length;
 
-    for (const file of Array.from(files)) {
-      // Match by filename prefix e.g. "01-slug.docx" → article index 0
+    for (const file of Array.from(files || [])) {
+      if (!/\.docx$/i.test(file.name)) {
+        results.push({
+          file: file.name, ok: false,
+          msg: /\.zip$/i.test(file.name)
+            ? "That is the zip — unzip it first, then choose the .docx files inside"
+            : "Not a .docx file (Word's older .doc format is not supported — use Save As → .docx)",
+        });
+        continue;
+      }
+
+      // Match by filename prefix e.g. "01-slug.docx" -> article index 0
       const match = file.name.match(/^(\d+)/);
       const idx = match ? parseInt(match[1], 10) - 1 : -1;
       const article = monthData.articles[idx];
       if (!article) {
-        results.push({ file: file.name, ok: false, msg: "Could not match to an article (name must start with 01-, 02-, etc.)" });
+        results.push({
+          file: file.name, ok: false,
+          msg: match
+            ? `No article #${idx + 1} in this month (it has ${total})`
+            : "Filename must start with the article number, e.g. 01-slug.docx",
+        });
         continue;
       }
+
       try {
         const arrayBuffer = await file.arrayBuffer();
-        const result = await mammoth.convertToHtml({ arrayBuffer });
+        // Word stores the photos inside the file. Mammoth would hand them back
+        // as base64 data URIs, which bloat the saved state and which WordPress
+        // will not host; map them back onto the original image URLs instead.
+        const known = article.images || [];
+        let imgIdx = 0;
+        const result = await mammoth.convertToHtml({ arrayBuffer }, {
+          convertImage: mammoth.images.imgElement(async (image) => {
+            const original = known[imgIdx++];
+            if (original?.url) return { src: original.url, alt: original.alt || "" };
+            const b64 = await image.read("base64");
+            return { src: `data:${image.contentType};base64,${b64}` };
+          }),
+        });
+
         const guarded = enforceBrand(result.value, profile, profile.forbidden);
         const words = countWords(guarded.html);
+        const imageCount = (guarded.html.match(/<img[\s>]/gi) || []).length;
         updateArticle(monthKey, article.id, {
           content: guarded.html, wordCount: words, status: "ready", error: null,
           faqCount: extractFaqPairs(guarded.html).length,
-          imageCount: (guarded.html.match(/<img[\s>]/gi) || []).length,
+          imageCount,
         });
         results.push({
           file: file.name, ok: true,
-          msg: `→ Article #${idx+1}: "${article.seoTitle || article.title}" · ${words} words`
+          msg: `-> Article #${idx + 1}: "${article.seoTitle || article.title}" · ${words} words · ${imageCount} image(s)`
             + (guarded.replaced ? ` · ${guarded.replaced} brand mention(s) rewritten` : ""),
         });
       } catch (err) {
@@ -2260,11 +2302,16 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
                         🔁 Retry Failed ({arts.filter(a=>a.status==="error").length})
                       </Btn>
                     )}
-                    {!isRunning && arts.some(a => a.status==="ready") && (
-                      <Btn onClick={() => publishReadyArticles(selectedMonth)} variant="warn">
-                        📤 Publish Ready ({arts.filter(a=>a.status==="ready").length})
-                      </Btn>
-                    )}
+                    {/* Publishes everything already written that is not yet live,
+                        so the Word round trip is optional rather than required. */}
+                    {!isRunning && arts.some(a => a.content) && (() => {
+                      const pending = publishableArticles(months[selectedMonth]).length;
+                      return (
+                        <Btn onClick={() => publishReadyArticles(selectedMonth)} variant={pending ? "warn" : "ghost"} disabled={!pending}>
+                          {pending ? `📤 Publish to WordPress (${pending})` : "✓ All published"}
+                        </Btn>
+                      );
+                    })()}
                     {isRunning && <Btn onClick={() => { abortRef.current=true; }} variant="danger">⛔ Stop</Btn>}
                   </div>
                   {arts.some(a => a.content) && (
@@ -2280,20 +2327,31 @@ Respond ONLY in JSON (no markdown): {"topics":[{"title":"...","keywords":"...","
 
               {(isRunning || logs.length > 0) && <PipelineVisualizer articles={arts} logs={logs} isRunning={isRunning} logEndRef={logEndRef} />}
 
-              {/* Upload corrected docs (non-English months) */}
-              {months[selectedMonth]?.language && months[selectedMonth].language !== "en" && (
+              {/* Optional edit round trip — available for every month, not only
+                  translated ones, and never required to publish. */}
+              {arts.some(a => a.content) && (
                 <div style={{ background:C.card, border:`1px solid rgba(129,140,248,0.3)`, borderRadius:14, padding:20, marginBottom:20 }}>
                   <div style={{ fontSize:13, fontWeight:700, color:"#a5b4fc", marginBottom:6 }}>
-                    📂 Upload Corrected Word Docs ({LANG_NAMES[months[selectedMonth].language]} articles)
+                    📂 Optional: edit the text first
+                    {months[selectedMonth]?.language && months[selectedMonth].language !== "en"
+                      ? ` (${LANG_NAMES[months[selectedMonth].language]} articles)` : ""}
                   </div>
                   <p style={{ fontSize:12, color:C.muted, marginBottom:12, lineHeight:1.6 }}>
-                    After auditing the downloaded Word files, upload the corrected <code>.docx</code> files here.
-                    Files must start with the article number (e.g. <code>01-slug.docx</code>, <code>02-slug.docx</code>).
-                    The corrected content will replace the article and it will be ready to schedule to WordPress.
+                    You do not need this to publish — <strong>Publish to WordPress</strong> above sends the articles as generated.
+                    To reword them first: download the Word files, edit them, then upload the changed <code>.docx</code> files here
+                    and publish. Keep the leading number in the filename (<code>01-slug.docx</code>, <code>02-slug.docx</code>) —
+                    that is how each file is matched to its article.
+                    <br />
+                    <span style={{ color:C.muted2 }}>
+                      Unzip the download first; the picker cannot see files that are still inside the <code>.zip</code>.
+                    </span>
                   </p>
                   <label style={{ display:"inline-block", padding:"9px 18px", background:"rgba(129,140,248,0.12)", border:"1px solid rgba(129,140,248,0.3)", borderRadius:9, color:"#a5b4fc", fontSize:13, fontWeight:600, cursor:"pointer" }}>
                     {uploadingDocs ? "Uploading…" : "Choose .docx files"}
-                    <input type="file" accept=".docx" multiple style={{ display:"none" }} disabled={uploadingDocs}
+                    {/* Both the extension and the MIME type, plus a catch-all, so
+                        Windows does not hide the files behind its type filter */}
+                    <input type="file" multiple style={{ display:"none" }} disabled={uploadingDocs}
+                      accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document,*/*"
                       onChange={e => handleCorrectedDocsUpload(selectedMonth, e.target.files)} />
                   </label>
                   {uploadResults.length > 0 && (
